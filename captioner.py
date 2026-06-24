@@ -2422,7 +2422,11 @@ def _download_hf_file(repo_id, filename):
         "-s", "16",
         "-k", "1M",
         "--summary-interval=1",
-        "--enable-color-rx=\\[\\K[0-9.]+%(,|\\])",
+        "--timeout=600",
+        "--retry-wait=3",
+        "--max-tries=5",
+        "--continue=true",
+        "--auto-file-renaming=false",
         url,
         "-d", dest_dir,
         "-o", filename
@@ -2477,7 +2481,7 @@ def _download_hf_file(repo_id, filename):
                             "eta_seconds": eta_secs,
                             "percent": pct
                         })
-                elif '%' in line_str:
+                else:
                     # Fallback: try to match simpler percentage patterns
                     m2 = _re.search(r'(\d+)%', line_str)
                     if m2:

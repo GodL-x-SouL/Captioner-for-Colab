@@ -21,7 +21,6 @@ import traceback
 import webbrowser
 import json
 import queue
-from urllib.parse import quote
 from pathlib import Path
 
 import requests
@@ -36,23 +35,9 @@ def _diag(msg):
 
 os.makedirs("./models", exist_ok=True)
 
-def _default_model_dir():
-    if os.environ.get("LLAMA_MODEL_DIR"):
-        return os.environ["LLAMA_MODEL_DIR"]
-    if os.path.isdir("/content"):
-        return "/content/models"
-    return "./models"
-
-def _default_llama_install_dir():
-    if os.environ.get("LLAMA_CPP_INSTALL_DIR"):
-        return os.environ["LLAMA_CPP_INSTALL_DIR"]
-    if os.path.isdir("/content"):
-        return "/content/llama.cpp"
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama.cpp")
-
 def _check_llama_binary():
     """Check if llama-server is accessible."""
-    raw = os.environ.get("LLAMA_SERVER_BIN", "llama-server")
+    raw = "llama-server"
     # Try direct PATH lookup
     if shutil.which(raw):
         return True
@@ -64,7 +49,7 @@ def _check_llama_binary():
 if _check_llama_binary():
     _diag("llama-server found in PATH")
 else:
-    _diag("llama-server not in PATH. Use Models tab auto setup to install the optimized binary.")
+    _diag("llama-server not in PATH. Set LLAMA_SERVER_BIN env var, add llama-server to PATH, or set the full path in Models tab.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE MANAGEMENT
@@ -93,21 +78,17 @@ class AppState:
             "llama_server_bin": os.environ.get("LLAMA_SERVER_BIN", "llama-server"),
             "model_path": os.environ.get("LLAMA_MODEL", ""),
             "mmproj_path": os.environ.get("LLAMA_MMPROJ", ""),
-            "model_dir": _default_model_dir(),
-            "mmproj_dir": _default_model_dir(),
+            "model_dir": "./models",
+            "mmproj_dir": "./models",
             "port": int(os.environ.get("LLAMA_PORT", 8080)),
             "ctx_size": 16384,
             "gpu_layers": 99
         }
         self.stats_lock = threading.Lock()
         self._load_config()
-        if os.path.isdir("/content") and not os.environ.get("LLAMA_MODEL_DIR"):
-            self.config["model_dir"] = _default_model_dir()
-            self.config["mmproj_dir"] = _default_model_dir()
-        os.makedirs(self.config.get("model_dir") or _default_model_dir(), exist_ok=True)
-        if os.path.isdir("/content") and not os.environ.get("LLAMA_MODEL_DIR"):
-            self.save_config()
-        elif not os.path.exists(CONFIG_FILE):
+        self.config["model_dir"] = "./models"
+        self.config["mmproj_dir"] = "./models"
+        if not os.path.exists(CONFIG_FILE):
             self.save_config()
 
         self.is_server_running = False
@@ -118,12 +99,14 @@ class AppState:
         self.log_lines = []
         self.log_lock = threading.Lock()
         self.batch_stop = False
-        self.batch_paused = False
         self.batch_running = False
         self.batch_thread = None
         self.batch_queue = None
         self.batch_progress = {"current": 0, "total": 0, "start_time": None, "eta": "Calculating..."}
         self.current_image_b64 = None
+        
+        self.completed_files = set()
+        self.downloader_running = False
 
 state = AppState()
 
@@ -147,8 +130,7 @@ def _scan_available_models(model_dir="./models", mmproj_dir="./models"):
         try:
             for f in sorted(os.listdir(model_dir)):
                 fp = os.path.join(model_dir, f)
-                lower_f = f.lower()
-                if os.path.isfile(fp) and lower_f.endswith(".gguf") and "mmproj" not in lower_f and "projector" not in lower_f:
+                if os.path.isfile(fp) and f.lower().endswith(".gguf") and not ('mmproj' in f.lower() or 'projector' in f.lower()):
                     ggufs.append({"name": f, "path": fp})
         except Exception as e:
             _log(f"Error scanning model_dir {model_dir}: {e}")
@@ -181,15 +163,8 @@ def _llama_running():
         return False
 
 def _resolve_llama_server_bin():
-    """Resolve the llama-server binary path from auto install locations or PATH."""
+    """Resolve the llama-server binary path for Windows."""
     raw = state.config.get("llama_server_bin", "llama-server")
-
-    bin_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
-    for root, dirs, files in os.walk(LLAMA_CPP_INSTALL_DIR):
-        if bin_name in files:
-            found = os.path.join(root, bin_name)
-            state.config["llama_server_bin"] = found
-            return found
 
     # If it's already an absolute path to a file that exists, use it
     if os.path.isabs(raw) and os.path.isfile(raw):
@@ -222,6 +197,63 @@ def _resolve_llama_server_bin():
                 return c
 
     return raw  # Return as-is, Popen will raise the error
+
+
+def _auto_setup_llama_binaries():
+    """Automatically downloads and configures the optimized llama-server binary for Colab/T4."""
+    bin_dir = os.path.abspath("./llama_binaries")
+    bin_name = "llama-server"
+    if sys.platform == "win32":
+        bin_name += ".exe"
+    bin_path = os.path.join(bin_dir, bin_name)
+
+    if os.path.exists(bin_path):
+        state.config["llama_server_bin"] = bin_path
+        state.save_config()
+        _log(f"Auto-setup: Found existing llama-server binary at {bin_path}")
+        return True
+
+    _log("Auto-setup: Optimized T4 llama-server binary not found. Initiating automatic setup...")
+    url = "https://github.com/GodL-x-SouL/Captioner-for-Colab/releases/download/v1.0/llama_binaries.zip"
+    os.makedirs(bin_dir, exist_ok=True)
+    tmp_zip = os.path.join(tempfile.gettempdir(), "llama_binaries.zip")
+
+    try:
+        if shutil.which("aria2c"):
+            _log("Auto-setup: using aria2c for fast download...")
+            cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", url, "-d", tempfile.gettempdir(), "-o", "llama_binaries.zip"]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            _log("Auto-setup: aria2c not found, falling back to requests...")
+            r = requests.get(url, stream=True, timeout=120)
+            r.raise_for_status()
+            with open(tmp_zip, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        import zipfile
+        with zipfile.ZipFile(tmp_zip, 'r') as zf:
+            zf.extractall(bin_dir)
+
+        if os.path.exists(bin_path):
+            if sys.platform != "win32":
+                os.chmod(bin_path, 0o755)
+            state.config["llama_server_bin"] = bin_path
+            state.save_config()
+            _log(f"Auto-setup: Successfully installed and configured llama-server binary at {bin_path}")
+            return True
+        else:
+            _log("Auto-setup error: llama-server binary not found in extracted zip files.")
+            return False
+    except Exception as e:
+        _log(f"Auto-setup failed: {e}")
+        return False
+    finally:
+        if os.path.exists(tmp_zip):
+            try:
+                os.remove(tmp_zip)
+            except:
+                pass
 
 
 def _start_llama_server(config_override=None):
@@ -262,9 +294,10 @@ def _start_llama_server(config_override=None):
     resolved_bin = _resolve_llama_server_bin()
     if not os.path.isfile(resolved_bin):
         return (
-            f"llama-server binary not found.\n"
+            f"llama-server binary not found: '{state.config.get('llama_server_bin', '')}'\n"
             f"Resolved to: {resolved_bin}\n\n"
-            f"Use Models tab auto setup to install the optimized binary for this runtime."
+            f"Please set the full path to llama-server in the Models tab or add it to your PATH.\n"
+            f"You can also set the LLAMA_SERVER_BIN environment variable."
         )
 
     _log(f"  Starting llama-server...")
@@ -303,7 +336,8 @@ def _start_llama_server(config_override=None):
         return (
             f"Cannot start llama-server: {e}\n"
             f"Command: {cmd[0]}\n\n"
-            f"Use Models tab auto setup to install llama-server for this runtime."
+            f"Ensure llama-server is installed and accessible.\n"
+            f"You can set the full path in config.json under 'llama_server_bin'."
         )
     except Exception as e:
         return f"Popen failed: {e}"
@@ -357,7 +391,7 @@ def _stop_llama_server():
 import platform
 import struct
 
-LLAMA_CPP_INSTALL_DIR = _default_llama_install_dir()
+LLAMA_CPP_INSTALL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama.cpp")
 GITHUB_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
 def _detect_hardware():
@@ -519,9 +553,7 @@ def _match_release_asset(assets, hw_info):
             patterns.append("ubuntu-cuda-13.3-x64")
         elif gpu == "AMD":
             patterns.append("ubuntu-rocm-7.2-x64")
-            patterns.append(f"ubuntu-vulkan-{arch}")
-        elif gpu == "Intel":
-            patterns.append(f"ubuntu-vulkan-{arch}")
+        patterns.append(f"ubuntu-vulkan-{arch}")
         patterns.append(f"ubuntu-x64")  # CPU fallback
 
     elif os_name == "macOS":
@@ -555,37 +587,6 @@ def _match_release_asset(assets, hw_info):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1], scored[0][2]
 
-def _require_aria2c():
-    aria = shutil.which("aria2c")
-    if not aria:
-        raise RuntimeError("aria2c is required for downloads. Install it in the runtime first.")
-    return aria
-
-def _download_with_aria2c(url, output_dir, output_name):
-    os.makedirs(output_dir, exist_ok=True)
-    aria = _require_aria2c()
-    cmd = [
-        aria,
-        "--continue=true",
-        "--max-connection-per-server=16",
-        "--split=16",
-        "--min-split-size=1M",
-        "--summary-interval=5",
-        "--file-allocation=none",
-        "--dir", output_dir,
-        "--out", output_name,
-    ]
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-    if token and "huggingface.co" in url:
-        cmd.extend(["--header", f"Authorization: Bearer {token}"])
-    cmd.append(url)
-    _log(f"  aria2c downloading {output_name}...")
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=None)
-    if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout or "aria2c failed").strip()
-        raise RuntimeError(msg[-1500:])
-    return os.path.join(output_dir, output_name)
-
 def _install_prebuilt_binary(asset, hw_info):
     """Download and extract a prebuilt binary from a GitHub release asset."""
     url = asset["browser_download_url"]
@@ -600,8 +601,21 @@ def _install_prebuilt_binary(asset, hw_info):
     tmp_path = os.path.join(tempfile.gettempdir(), name)
 
     try:
-        _download_with_aria2c(url, tempfile.gettempdir(), name)
-        _log(f"  Download complete.")
+        # Download with progress
+        r = requests.get(url, stream=True, timeout=300)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(tmp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = (downloaded / total) * 100
+                    if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
+                        _log(f"  Download progress: {pct:.0f}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+
+        _log(f"  Download complete: {downloaded // (1024*1024)}MB")
 
         # Extract
         _log(f"  Extracting to {install_dir}...")
@@ -647,95 +661,10 @@ def _install_prebuilt_binary(asset, hw_info):
         except Exception:
             pass
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # IMAGE PROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
-HF_API_BASE = "https://huggingface.co/api"
-HF_DOWNLOAD_BASE = "https://huggingface.co"
-MODEL_PRESETS = {
-    "qwen3_vl_8b": {
-        "label": "Qwen3-VL 8B Instruct",
-        "repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
-    },
-    "gemma4_12b": {
-        "label": "Gemma 4 12B IT",
-        "repo": "unsloth/gemma-4-12b-it-GGUF",
-    },
-}
-
-def _hf_headers():
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-    return {"Authorization": f"Bearer {token}"} if token else {}
-
-def _hf_model_info(repo_id):
-    r = requests.get(f"{HF_API_BASE}/models/{repo_id}", headers=_hf_headers(), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def _hf_gguf_files(repo_id):
-    info = _hf_model_info(repo_id)
-    siblings = info.get("siblings", [])
-    files = []
-    for item in siblings:
-        name = item.get("rfilename", "")
-        if name.lower().endswith(".gguf"):
-            files.append({
-                "name": name,
-                "size": item.get("size"),
-                "is_mmproj": "mmproj" in name.lower() or "projector" in name.lower(),
-            })
-    return sorted(files, key=lambda x: x["name"].lower())
-
-def _pick_preset_files(repo_id):
-    files = _hf_gguf_files(repo_id)
-    main_candidates = [f for f in files if not f["is_mmproj"]]
-    mmproj_candidates = [f for f in files if f["is_mmproj"]]
-
-    def pick(candidates, preferred):
-        preferred = preferred.lower()
-        for f in candidates:
-            if preferred in f["name"].lower():
-                return f
-        return candidates[0] if candidates else None
-
-    main = pick(main_candidates, "q8_0")
-    mmproj = pick(mmproj_candidates, "f16")
-    if not main:
-        raise RuntimeError(f"No main GGUF file found in {repo_id}")
-    if not mmproj:
-        raise RuntimeError(f"No MMProj GGUF file found in {repo_id}")
-    return [main, mmproj]
-
-def _hf_download_url(repo_id, filename):
-    return f"{HF_DOWNLOAD_BASE}/{repo_id}/resolve/main/{quote(filename, safe='/')}"
-
-def _download_hf_files(repo_id, filenames):
-    model_dir = state.config.get("model_dir") or _default_model_dir()
-    state.config["model_dir"] = model_dir
-    state.config["mmproj_dir"] = model_dir
-    state.save_config()
-    os.makedirs(model_dir, exist_ok=True)
-
-    downloaded = []
-    for filename in filenames:
-        out_name = os.path.basename(filename)
-        out_path = os.path.join(model_dir, out_name)
-        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
-            _log(f"  Already exists: {out_name}")
-            downloaded.append(out_path)
-            continue
-        url = _hf_download_url(repo_id, filename)
-        downloaded.append(_download_with_aria2c(url, model_dir, out_name))
-    return downloaded
-
-def _format_size(num_bytes):
-    if not num_bytes:
-        return "unknown size"
-    mb = num_bytes / (1024 * 1024)
-    if mb >= 1024:
-        return f"{mb / 1024:.2f} GB"
-    return f"{mb:.1f} MB"
-
 def _frame_to_b64(img):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
@@ -915,6 +844,11 @@ def _producer(cfg, q, stats):
         images = [os.path.join(input_folder,f) for f in all_files if f.lower().endswith(IMAGE_EXTS)]
 
         for img_src in images:
+            if state.batch_stop:
+                break
+            with state.stats_lock:
+                if img_src in state.completed_files:
+                    continue
             stem = os.path.splitext(os.path.basename(img_src))[0]
             txt = os.path.join(output_folder, stem + ".txt")
             if skip_ex and os.path.exists(txt):
@@ -939,9 +873,6 @@ def _consumer(cfg, q, stats):
     trigger       = _safe_get(cfg, "trigger", "")
 
     while True:
-        while state.batch_paused and not state.batch_stop:
-            time.sleep(0.2)
-
         try:
             item = q.get(timeout=1)
         except queue.Empty:
@@ -1019,6 +950,7 @@ def _consumer(cfg, q, stats):
                 _log(f"  {fname}: {cap[:100]}...")
                 with state.stats_lock:
                     stats['done'] += 1
+                    state.completed_files.add(src)
             update_prog()
 
         except Exception as e:
@@ -1032,7 +964,6 @@ def _consumer(cfg, q, stats):
 def _run_batch(cfg):
     global state
     state.batch_stop = False
-    state.batch_paused = False
     _log(f"  Batch started: input={_safe_get(cfg,'input_folder','')}")
 
     input_folder = _safe_get(cfg, "input_folder", "")
@@ -1112,6 +1043,25 @@ HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+/* Custom scrollbar matching the overall UI */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-4);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
 :root{
   --bg:#fafafa;--bg-soft:#f4f4f4;--bg-card:#ffffff;
   --border:#ddd;--border-soft:#eee;
@@ -1134,17 +1084,6 @@ HTML = r"""<!DOCTYPE html>
   --shadow-sm:0 1px 2px rgba(0,0,0,0.3);
   --shadow-md:0 2px 8px rgba(0,0,0,0.4);
 }
-*{
-  scrollbar-width:thin;
-  scrollbar-color:var(--accent) var(--bg-soft);
-}
-*::-webkit-scrollbar{width:8px;height:8px;}
-*::-webkit-scrollbar-track{background:var(--bg-soft);border-radius:8px;}
-*::-webkit-scrollbar-thumb{
-  background:linear-gradient(180deg,var(--accent),var(--accent-deep));
-  border:2px solid var(--bg-soft);border-radius:8px;
-}
-*::-webkit-scrollbar-thumb:hover{background:var(--accent-deep);}
 body{
   font-family:var(--font-sans);font-size:12px;font-weight:300;line-height:1.6;
   color:var(--ink);background:var(--bg);
@@ -1299,7 +1238,11 @@ select.path-input{
   font-family:var(--font-mono);font-size:10px;line-height:1.8;
   color:var(--ink-3);height:380px;overflow-y:auto;
   white-space:pre-wrap;word-break:break-word;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent;
 }
+.log-box::-webkit-scrollbar{width:6px;}
+.log-box::-webkit-scrollbar-track{background:transparent;}
+.log-box::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
 .status-dot{
   display:inline-block;width:8px;height:8px;border-radius:50%;
   background:var(--border);margin-right:6px;flex-shrink:0;
@@ -1398,7 +1341,7 @@ select.path-input{
       <div class="card"><div class="section">
         <div class="slabel">Run</div>
         <button class="btn-primary" id="i_go-btn" onclick="startImages()" style="width:100%;">Start Captioning</button>
-        <button class="btn-danger" id="i_pause-btn" onclick="toggleBatchPause()" style="margin-top:6px;" disabled>Stop</button>
+        <button class="btn-danger" id="i_stop-btn" onclick="stopBatch()" style="margin-top:6px;width:100%;">Stop</button>
         <div class="progress-container" id="i_progress-container" style="display:none;">
           <div class="progress-bar-bg"><div class="progress-bar-fill" id="i_progress-fill"></div></div>
           <div class="progress-text" id="i_progress-text">Processed 0/0 &middot; ETA: Calculating...</div>
@@ -1431,11 +1374,17 @@ select.path-input{
 
       <div id="install-status" style="font-size:11px;color:var(--muted-2);margin-bottom:12px;"></div>
 
-      <button class="btn-primary" id="btn-auto-install" onclick="autoInstallLlama()" style="width:100%;margin-bottom:12px;">Auto Setup Optimized Binary</button>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button class="btn-primary" id="btn-fetch-releases" onclick="fetchReleases()" style="width:100%;">Check for Prebuilt Binaries</button>
+      </div>
 
       <div id="releases-section" style="display:none;">
         <div class="slabel">Recommended Binary</div>
         <div id="recommended-binary" style="font-size:11px;color:var(--muted-2);margin-bottom:8px;"></div>
+        <button class="btn-primary" id="btn-install-recommended" onclick="installRecommended()" style="width:100%;margin-bottom:12px;" disabled>Install Recommended Binary</button>
+
+        <div class="slabel">All Available Binaries</div>
+        <div id="all-binaries" style="max-height:200px;overflow-y:auto;margin-bottom:8px;"></div>
       </div>
     </div></div>
   </div>
@@ -1457,7 +1406,7 @@ select.path-input{
         <span id="model-val-text" style="color:var(--muted-3);">Waiting for validation</span>
       </div>
 
-      <div class="slabel">Select MMProj (GGUF/Safetensors)</div>
+      <div class="slabel" style="margin-top:12px;">Select MMProj (GGUF/Safetensors)</div>
       <select id="mmproj-select" class="path-input" style="margin-bottom:4px;">
         <option value="">-- Scanning --</option>
       </select>
@@ -1476,23 +1425,25 @@ select.path-input{
   <div class="section-title" style="margin-top:24px;">Model Downloader</div>
   <div class="layout">
     <div class="card"><div class="section">
-      <div class="slabel">Curated Downloads</div>
-      <button class="btn-primary" onclick="downloadPreset('qwen3_vl_8b')" style="width:100%;margin-bottom:8px;">Download Qwen3-VL 8B Q8_0 + F16 MMProj</button>
-      <button class="btn-primary" onclick="downloadPreset('gemma4_12b')" style="width:100%;margin-bottom:8px;">Download Gemma 4 12B Q8_0 + F16 MMProj</button>
-      <div id="download-status" style="font-size:11px;color:var(--muted-2);margin-top:8px;">Downloads are saved to the configured model folder.</div>
-    </div></div>
-
-    <div class="card"><div class="section">
-      <div class="slabel">Search Hugging Face GGUF Repos</div>
-      <div style="display:flex;gap:8px;margin-bottom:8px;">
-        <input class="path-input" id="hf-search-input" placeholder="Search model repos, e.g. smolvlm" style="flex:1;margin-bottom:0;">
-        <button class="btn" onclick="searchHfModels()">Search</button>
+      <div class="slabel">Presets</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button class="btn-primary" onclick="downloadPreset('qwen')" style="flex:1;">Download Qwen 3 8B VL (Q8_0 + F16 MMProj)</button>
+        <button class="btn-primary" onclick="downloadPreset('gemma')" style="flex:1;">Download Gemma 4 12B (Q8_0 + F16 MMProj)</button>
       </div>
-      <select id="hf-repo-select" class="path-input" onchange="loadHfRepoFiles()">
-        <option value="">-- Search first --</option>
-      </select>
-      <div id="hf-file-list" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px;background:var(--bg-soft);font-size:11px;color:var(--muted-2);margin-bottom:8px;">Select a repo to list GGUF files.</div>
-      <button class="btn-primary" onclick="downloadSelectedHfFiles()" style="width:100%;">Download Selected Files</button>
+
+      <div class="slabel">Search Hugging Face</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <input class="path-input" id="hf-search-input" placeholder="Search models, e.g. smolvlm" style="flex:1;" onkeydown="if(event.key==='Enter')searchHF()">
+        <button class="btn" onclick="searchHF()">Search</button>
+      </div>
+
+      <div id="hf-search-results" style="max-height:200px;overflow-y:auto;margin-bottom:12px;display:none;border:1px solid var(--border);padding:6px;border-radius:var(--radius);background:var(--bg-soft);"></div>
+      <div id="hf-files-section" style="display:none;margin-top:12px;">
+        <div class="slabel" id="hf-files-title">Files in Repository</div>
+        <div id="hf-files-list" style="max-height:200px;overflow-y:auto;margin-bottom:12px;border:1px solid var(--border);padding:6px;border-radius:var(--radius);background:var(--bg-soft);"></div>
+      </div>
+      
+      <div id="download-progress-display" style="font-size:11px;color:var(--muted-2);margin-top:8px;"></div>
     </div></div>
   </div>
 </div>
@@ -1532,43 +1483,67 @@ let _logInterval=null,_lastLen=0;
 
 function _startBatch(cfg){
   document.getElementById('i_go-btn').disabled=true;
-  const pauseBtn=document.getElementById('i_pause-btn');
-  pauseBtn.disabled=false;pauseBtn.textContent='Stop';
   document.getElementById('i_log-box').textContent='Starting...';
   _lastLen=0;
   fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)})
   .then(r=>r.json()).then(d=>{
     if(d.ok){_logInterval=setInterval(()=>pollLog(),800);}
-    else{document.getElementById('i_log-box').textContent=d.error;document.getElementById('i_go-btn').disabled=false;pauseBtn.disabled=true;}
+    else{document.getElementById('i_log-box').textContent=d.error;document.getElementById('i_go-btn').disabled=false;}
   });
 }
 
 function startImages(){
+  const stopBtn = document.getElementById('i_stop-btn');
+  if (stopBtn) {
+    stopBtn.textContent = 'Stop';
+    stopBtn.className = 'btn-danger';
+    stopBtn.style.background = '';
+    stopBtn.style.borderColor = '';
+  }
+
   const cfg={
     ...I,
     input_folder:document.getElementById('i_input_folder').value.trim(),
     output_folder:document.getElementById('i_output_folder').value.trim(),
     trigger:document.getElementById('i_trigger').value.trim(),
     system_prompt:document.getElementById('i_system_prompt').value.trim(),
-    mode:'image',num_workers:1
+    mode:'image',num_workers:1,
+    resume:false
   };
   if(!cfg.input_folder){alert('Set input folder first');return;}
   _startBatch(cfg);
 }
 
-async function toggleBatchPause(){
-  const btn=document.getElementById('i_pause-btn');
-  const paused=btn.dataset.paused==='1';
-  btn.disabled=true;
-  try{
-    const res=await fetch(paused?'/resume':'/stop',{method:'POST'});
-    const data=await res.json();
-    if(data.ok){
-      btn.dataset.paused=data.paused?'1':'0';
-      btn.textContent=data.paused?'Resume':'Stop';
-      btn.disabled=!data.running;
-    }
-  }catch(e){console.error('Pause/resume failed:',e);btn.disabled=false;}
+function resumeImages() {
+  const cfg={
+    ...I,
+    input_folder:document.getElementById('i_input_folder').value.trim(),
+    output_folder:document.getElementById('i_output_folder').value.trim(),
+    trigger:document.getElementById('i_trigger').value.trim(),
+    system_prompt:document.getElementById('i_system_prompt').value.trim(),
+    mode:'image',num_workers:1,
+    resume:true
+  };
+  if(!cfg.input_folder){alert('Set input folder first');return;}
+  _startBatch(cfg);
+}
+
+function stopBatch(){
+  const btn = document.getElementById('i_stop-btn');
+  if (btn.textContent === 'Stop') {
+    fetch('/stop',{method:'POST'}).then(r=>r.json()).then(d=>{
+      btn.textContent = 'Resume';
+      btn.className = 'btn-primary';
+      btn.style.background = 'var(--success)';
+      btn.style.borderColor = 'var(--success)';
+    });
+  } else {
+    btn.textContent = 'Stop';
+    btn.className = 'btn-danger';
+    btn.style.background = '';
+    btn.style.borderColor = '';
+    resumeImages();
+  }
 }
 
 async function testSingle(){
@@ -1597,9 +1572,18 @@ function pollLog(){
   fetch('/log?from='+_lastLen).then(r=>r.json()).then(d=>{
     const box=document.getElementById('i_log-box');
     if(d.lines.length){if(_lastLen===0)box.textContent='';box.textContent+=d.lines.join('\n')+'\n';box.scrollTop=box.scrollHeight;_lastLen+=d.lines.length;}
-    const pauseBtn=document.getElementById('i_pause-btn');
-    if(pauseBtn){pauseBtn.dataset.paused=d.paused?'1':'0';pauseBtn.textContent=d.paused?'Resume':'Stop';pauseBtn.disabled=d.done;}
-    if(d.done){clearInterval(_logInterval);document.getElementById('i_go-btn').disabled=false;document.getElementById('i_progress-container').style.display='none';}
+    if(d.done){
+      clearInterval(_logInterval);
+      document.getElementById('i_go-btn').disabled=false;
+      document.getElementById('i_progress-container').style.display='none';
+      const stopBtn = document.getElementById('i_stop-btn');
+      if (stopBtn && stopBtn.textContent !== 'Resume') {
+        stopBtn.textContent = 'Stop';
+        stopBtn.className = 'btn-danger';
+        stopBtn.style.background = '';
+        stopBtn.style.borderColor = '';
+      }
+    }
     _updateDot(d.server_running);
   });
   fetch('/progress').then(r=>r.json()).then(p=>{
@@ -1626,6 +1610,7 @@ setInterval(()=>{fetch('/status').then(r=>r.json()).then(d=>_updateDot(d.running
 // LLAMA.CPP INSTALLER JS
 // ─────────────────────────────────────────────────────────────────────────────
 let _hwInfo = null;
+let _recommendedAsset = null;
 
 async function detectHardware(){
   try{
@@ -1654,17 +1639,68 @@ async function detectHardware(){
   }
 }
 
-async function autoInstallLlama(){
-  const btn = document.getElementById('btn-auto-install');
-  btn.disabled = true; btn.textContent = 'Setting Up...';
-  document.getElementById('install-status').innerHTML = '<span style="color:var(--accent);">Detecting best optimized binary...</span>';
+async function fetchReleases(){
+  const btn = document.getElementById('btn-fetch-releases');
+  btn.disabled = true; btn.textContent = 'Loading...';
   try{
-    const res = await fetch('/installer/auto_install', {method:'POST'});
+    const res = await fetch('/installer/releases');
+    const data = await res.json();
+    if(!data.ok){ alert('Error: ' + data.error); return; }
+
+    const hw = data.hardware;
+    document.getElementById('hw-info').innerHTML += `<br>Latest release: <strong>${data.version}</strong>`;
+
+    // Show recommended
+    const rec = data.recommended;
+    const recDiv = document.getElementById('recommended-binary');
+    if(rec.name){
+      recDiv.innerHTML = `<strong>${rec.name}</strong><br><span style="font-size:10px;">${rec.size_mb} MB &middot; Matched: ${rec.matched_pattern}</span>`;
+      _recommendedAsset = rec;
+      document.getElementById('btn-install-recommended').disabled = false;
+    } else {
+      recDiv.innerHTML = '<span style="color:var(--muted-3);">No matching binary found for your hardware.</span>';
+    }
+
+    // Show all available
+    const binDiv = document.getElementById('all-binaries');
+    let html = '<table style="width:100%;font-size:10px;border-collapse:collapse;">';
+    html += '<tr style="color:var(--muted-3);text-align:left;border-bottom:1px solid var(--border);"><th style="padding:4px 6px;">Name</th><th style="padding:4px 6px;">Size</th><th style="padding:4px 6px;"></th></tr>';
+    data.available.forEach(b => {
+      const isRec = rec.name === b.name;
+      html += `<tr style="border-bottom:1px solid var(--border-soft);${isRec?'background:var(--accent-soft);':''}">`;
+      html += `<td style="padding:4px 6px;word-break:break-all;">${b.name}</td>`;
+      html += `<td style="padding:4px 6px;white-space:nowrap;">${b.size_mb} MB</td>`;
+      html += `<td style="padding:4px 6px;white-space:nowrap;"><button class="btn" onclick="installBinary('${b.name}','${b.url}')" style="padding:2px 8px;">Install</button></td>`;
+      html += '</tr>';
+    });
+    html += '</table>';
+    binDiv.innerHTML = html;
+
+    document.getElementById('releases-section').style.display = 'block';
+  } catch(e){
+    alert('Failed to fetch releases: ' + e);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Check for Prebuilt Binaries';
+  }
+}
+
+async function installRecommended(){
+  if(!_recommendedAsset){ return; }
+  await installBinary(_recommendedAsset.name, _recommendedAsset.url);
+}
+
+async function installBinary(name, url){
+  const btn = document.getElementById('btn-install-recommended');
+  btn.disabled = true; btn.textContent = 'Installing...';
+  document.getElementById('install-status').innerHTML = '<span style="color:var(--accent);">Downloading ' + name + '...</span>';
+  try{
+    const res = await fetch('/installer/install_prebuilt', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({asset_name: name, asset_url: url})
+    });
     const data = await res.json();
     if(data.ok){
-      document.getElementById('install-status').innerHTML = '<span style="color:var(--success);">&#10003; Installed optimized binary</span>';
-      document.getElementById('recommended-binary').innerHTML = `<strong>${data.asset}</strong><br><span style="font-size:10px;">Matched: ${data.matched_pattern || 'auto'}</span>`;
-      document.getElementById('releases-section').style.display = 'block';
+      document.getElementById('install-status').innerHTML = '<span style="color:var(--success);">&#10003; Installed: ' + name + '</span>';
       detectHardware();
     } else {
       document.getElementById('install-status').innerHTML = '<span style="color:var(--danger);">&#10007; Install failed: ' + data.error + '</span>';
@@ -1672,7 +1708,7 @@ async function autoInstallLlama(){
   } catch(e){
     document.getElementById('install-status').innerHTML = '<span style="color:var(--danger);">&#10007; Error: ' + e + '</span>';
   } finally {
-    btn.disabled = false; btn.textContent = 'Auto Setup Optimized Binary';
+    btn.disabled = false; btn.textContent = 'Install Recommended Binary';
   }
 }
 
@@ -1742,74 +1778,101 @@ async function applyModel(){
   finally{btn.disabled=false;btn.textContent="Apply & Restart Server";}
 }
 
-async function downloadPreset(preset){
-  const status=document.getElementById('download-status');
-  status.innerHTML='<span style="color:var(--accent);">Starting download with aria2c...</span>';
-  try{
-    const res=await fetch('/models/download_preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preset})});
-    const data=await res.json();
-    if(data.ok){
-      status.innerHTML='<span style="color:var(--success);">&#10003; Downloaded '+data.files.length+' file(s)</span>';
-      loadModels();
-    }else{
-      status.innerHTML='<span style="color:var(--danger);">&#10007; '+data.error+'</span>';
+// Model Downloader functions
+async function downloadPreset(presetName) {
+  const display = document.getElementById('download-progress-display');
+  display.innerHTML = '<span style="color:var(--accent);">Starting download... Check Live Log at bottom of Images tab.</span>';
+  try {
+    const res = await fetch('/downloader/download_preset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({preset: presetName})
+    });
+    const data = await res.json();
+    if(data.ok) {
+      display.innerHTML = '<span style="color:var(--success);">Download started! Check Live Log at bottom of Images tab.</span>';
+    } else {
+      display.innerHTML = '<span style="color:var(--danger);">Failed to start: ' + data.error + '</span>';
     }
-  }catch(e){status.innerHTML='<span style="color:var(--danger);">&#10007; '+e+'</span>';}
+  } catch(e) {
+    display.innerHTML = '<span style="color:var(--danger);">Error: ' + e + '</span>';
+  }
 }
 
-async function searchHfModels(){
-  const q=document.getElementById('hf-search-input').value.trim();
-  const repoSelect=document.getElementById('hf-repo-select');
-  if(!q){alert('Enter a search term first.');return;}
-  repoSelect.innerHTML='<option value="">Searching...</option>';
-  try{
-    const res=await fetch('/models/search_hf?q='+encodeURIComponent(q));
-    const data=await res.json();
-    repoSelect.innerHTML='<option value="">-- Select repo --</option>';
-    if(data.ok){
-      data.repos.forEach(r=>{const o=document.createElement('option');o.value=r.id;o.textContent=r.id;repoSelect.appendChild(o);});
-    }else{alert(data.error);}
-  }catch(e){alert('Search failed: '+e);}
-}
-
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-async function loadHfRepoFiles(){
-  const repo=document.getElementById('hf-repo-select').value;
-  const list=document.getElementById('hf-file-list');
-  if(!repo){list.textContent='Select a repo to list GGUF files.';return;}
-  list.textContent='Loading files...';
-  try{
-    const res=await fetch('/models/hf_files?repo='+encodeURIComponent(repo));
-    const data=await res.json();
-    if(!data.ok){list.textContent=data.error;return;}
-    if(!data.files.length){list.textContent='No GGUF files found in this repo.';return;}
-    list.innerHTML=data.files.map(f=>{
-      const label=f.name+' ('+f.size_text+')';
-      return `<label class="toggle-row" style="align-items:flex-start;margin-bottom:6px;"><input type="checkbox" class="hf-file-check" value="${escapeHtml(f.name)}" style="margin-top:3px;"><span class="toggle-label" style="word-break:break-all;">${escapeHtml(label)}</span></label>`;
-    }).join('');
-  }catch(e){list.textContent='File listing failed: '+e;}
-}
-
-async function downloadSelectedHfFiles(){
-  const repo=document.getElementById('hf-repo-select').value;
-  const files=[...document.querySelectorAll('.hf-file-check:checked')].map(x=>x.value);
-  const status=document.getElementById('download-status');
-  if(!repo){alert('Select a repo first.');return;}
-  if(!files.length){alert('Select at least one GGUF file.');return;}
-  status.innerHTML='<span style="color:var(--accent);">Downloading selected files with aria2c...</span>';
-  try{
-    const res=await fetch('/models/download_hf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo,files})});
-    const data=await res.json();
-    if(data.ok){
-      status.innerHTML='<span style="color:var(--success);">&#10003; Downloaded '+data.files.length+' file(s)</span>';
-      loadModels();
-    }else{
-      status.innerHTML='<span style="color:var(--danger);">&#10007; '+data.error+'</span>';
+async function searchHF() {
+  const query = document.getElementById('hf-search-input').value.trim();
+  if(!query) { alert('Please enter a search query'); return; }
+  const resultsDiv = document.getElementById('hf-search-results');
+  resultsDiv.style.display = 'block';
+  resultsDiv.innerHTML = '<span style="color:var(--accent);">Searching...</span>';
+  document.getElementById('hf-files-section').style.display = 'none';
+  try {
+    const res = await fetch('/downloader/search?query=' + encodeURIComponent(query));
+    const data = await res.json();
+    if(data.ok && data.results.length > 0) {
+      let html = '<table style="width:100%;font-size:10px;border-collapse:collapse;">';
+      data.results.forEach(r => {
+        html += `<tr style="border-bottom:1px solid var(--border-soft);cursor:pointer;" onclick="selectHFRepo('${r.id}')">`;
+        html += `<td style="padding:6px;font-weight:bold;color:var(--accent);">${r.id}</td>`;
+        html += `<td style="padding:6px;text-align:right;color:var(--muted-3);">${r.downloads} downloads</td>`;
+        html += `</tr>`;
+      });
+      html += '</table>';
+      resultsDiv.innerHTML = html;
+    } else {
+      resultsDiv.innerHTML = '<span style="color:var(--muted-3);">No repositories found.</span>';
     }
-  }catch(e){status.innerHTML='<span style="color:var(--danger);">&#10007; '+e+'</span>';}
+  } catch(e) {
+    resultsDiv.innerHTML = '<span style="color:var(--danger);">Search error: ' + e + '</span>';
+  }
+}
+
+async function selectHFRepo(repoId) {
+  const filesSection = document.getElementById('hf-files-section');
+  const filesList = document.getElementById('hf-files-list');
+  const filesTitle = document.getElementById('hf-files-title');
+  filesSection.style.display = 'block';
+  filesTitle.textContent = 'Files in ' + repoId;
+  filesList.innerHTML = '<span style="color:var(--accent);">Loading files...</span>';
+  try {
+    const res = await fetch('/downloader/files?repo_id=' + encodeURIComponent(repoId));
+    const data = await res.json();
+    if(data.ok && data.files.length > 0) {
+      let html = '<table style="width:100%;font-size:10px;border-collapse:collapse;">';
+      data.files.forEach(f => {
+        html += `<tr style="border-bottom:1px solid var(--border-soft);">`;
+        html += `<td style="padding:6px;word-break:break-all;">${f}</td>`;
+        html += `<td style="padding:6px;text-align:right;"><button class="btn" onclick="downloadHFFile('${repoId}','${f}')" style="padding:2px 8px;">Download</button></td>`;
+        html += `</tr>`;
+      });
+      html += '</table>';
+      filesList.innerHTML = html;
+    } else {
+      filesList.innerHTML = '<span style="color:var(--muted-3);">No matching GGUF or MMProj files found.</span>';
+    }
+  } catch(e) {
+    filesList.innerHTML = '<span style="color:var(--danger);">Error loading files: ' + e + '</span>';
+  }
+}
+
+async function downloadHFFile(repoId, filename) {
+  const display = document.getElementById('download-progress-display');
+  display.innerHTML = `<span style="color:var(--accent);">Starting download of ${filename}... Check Live Log at bottom of Images tab.</span>`;
+  try {
+    const res = await fetch('/downloader/download_file', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({repo_id: repoId, filename: filename})
+    });
+    const data = await res.json();
+    if(data.ok) {
+      display.innerHTML = `<span style="color:var(--success);">Started downloading ${filename}! Check Live Log at bottom of Images tab.</span>`;
+    } else {
+      display.innerHTML = '<span style="color:var(--danger);">Failed to start: ' + data.error + '</span>';
+    }
+  } catch(e) {
+    display.innerHTML = '<span style="color:var(--danger);">Error: ' + e + '</span>';
+  }
 }
 
 if(document.getElementById('tb-models').classList.contains('active')){loadModels();_initInstaller();}
@@ -1877,6 +1940,11 @@ def start():
     if not cfg:
         return jsonify({"ok": False, "error": "invalid JSON"})
 
+    resume = cfg.get("resume", False)
+    if not resume:
+        with state.stats_lock:
+            state.completed_files.clear()
+
     out = cfg.get("output_folder") or cfg["input_folder"]
     if cfg.get("skip_existing", False) and os.path.isdir(out):
         txt_count = len([f for f in os.listdir(out) if f.endswith(".txt")])
@@ -1895,7 +1963,6 @@ def start():
             with state.log_lock:
                 state.log_lines.append(err)
         finally:
-            state.batch_paused = False
             state.batch_running = False
             with state.log_lock:
                 state.log_lines.append("\n[Batch process finished]")
@@ -1907,30 +1974,33 @@ def start():
 @app.route("/stop", methods=["POST"])
 def stop():
     global state
-    if not state.batch_running:
-        return jsonify({"ok": True, "paused": False, "running": False})
-    state.batch_paused = True
-    _log("Pause requested. Current inference will finish, then the batch will wait for resume.")
-    return jsonify({"ok": True, "paused": True, "running": True})
+    state.batch_stop = True
+    _log("Stop requested. Clearing queue and finishing current items...")
 
-@app.route("/resume", methods=["POST"])
-def resume():
-    global state
-    if state.batch_running and state.batch_paused:
-        state.batch_paused = False
-        _log("Resume requested. Continuing from queued checkpoint...")
-    return jsonify({"ok": True, "paused": state.batch_paused, "running": state.batch_running})
+    if state.batch_queue:
+        count = 0
+        while not state.batch_queue.empty():
+            try:
+                state.batch_queue.get_nowait()
+                state.batch_queue.task_done()
+                count += 1
+            except queue.Empty:
+                break
+        if count > 0:
+            _log(f"  Cleared {count} pending items from queue.")
+
+    return jsonify({"ok": True})
 
 @app.route("/log")
 def log():
     from_idx = int(request.args.get("from", 0))
     with state.log_lock:
         lines = state.log_lines[from_idx:]
-    return jsonify({"lines": lines, "done": not state.batch_running, "paused": state.batch_paused, "server_running": _llama_running()})
+    return jsonify({"lines": lines, "done": not state.batch_running, "server_running": _llama_running()})
 
 @app.route("/status")
 def status():
-    return jsonify({"running": _llama_running(), "batch": state.batch_running, "paused": state.batch_paused})
+    return jsonify({"running": _llama_running(), "batch": state.batch_running})
 
 @app.route("/progress")
 def progress():
@@ -1970,10 +2040,8 @@ def test_single():
 
 @app.route("/models", methods=["GET"])
 def get_models():
-    model_dir = state.config.get("model_dir") or _default_model_dir()
-    mmproj_dir = state.config.get("mmproj_dir") or model_dir
-    state.config["model_dir"] = model_dir
-    state.config["mmproj_dir"] = mmproj_dir
+    model_dir = request.args.get("model_dir", state.config.get("model_dir", "./models"))
+    mmproj_dir = request.args.get("mmproj_dir", state.config.get("mmproj_dir", "./models"))
 
     available = _scan_available_models(model_dir=model_dir, mmproj_dir=mmproj_dir)
     return jsonify({
@@ -1981,8 +2049,9 @@ def get_models():
         "current": {
             "model": state.config["model_path"],
             "mmproj": state.config["mmproj_path"],
-            "model_dir": model_dir,
-            "mmproj_dir": mmproj_dir,
+            "model_dir": state.config.get("model_dir", "./models"),
+            "mmproj_dir": state.config.get("mmproj_dir", "./models"),
+            "llama_server_bin": state.config.get("llama_server_bin", "llama-server"),
             "is_running": state.is_server_running
         }
     })
@@ -2014,6 +2083,9 @@ def set_model():
     data = request.get_json()
     new_model = data.get("model")
     new_mmproj = data.get("mmproj", "")
+    new_model_dir = data.get("model_dir", "")
+    new_mmproj_dir = data.get("mmproj_dir", "")
+    new_llama_bin = data.get("llama_server_bin", "")
 
     if not new_model:
         return jsonify({"ok": False, "error": "Missing model path"}), 400
@@ -2026,6 +2098,12 @@ def set_model():
 
     state.config["model_path"] = new_model
     state.config["mmproj_path"] = new_mmproj
+    if new_model_dir:
+        state.config["model_dir"] = new_model_dir
+    if new_mmproj_dir:
+        state.config["mmproj_dir"] = new_mmproj_dir
+    if new_llama_bin:
+        state.config["llama_server_bin"] = new_llama_bin
     state.save_config()
 
     if state.batch_running:
@@ -2041,74 +2119,6 @@ def set_model():
 # ─────────────────────────────────────────────────────────────────────────────
 # LLAMA.CPP INSTALLER API
 # ─────────────────────────────────────────────────────────────────────────────
-@app.route("/models/download_preset", methods=["POST"])
-def download_model_preset():
-    data = request.get_json() or {}
-    preset_key = data.get("preset", "")
-    preset = MODEL_PRESETS.get(preset_key)
-    if not preset:
-        return jsonify({"ok": False, "error": "Unknown preset"}), 400
-    try:
-        selected = _pick_preset_files(preset["repo"])
-        paths = _download_hf_files(preset["repo"], [f["name"] for f in selected])
-        return jsonify({"ok": True, "repo": preset["repo"], "files": paths})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/models/search_hf", methods=["GET"])
-def search_hf_models():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"ok": False, "error": "Missing search query"}), 400
-    try:
-        params = {"search": q, "limit": 25, "sort": "downloads", "direction": -1}
-        r = requests.get(f"{HF_API_BASE}/models", params=params, headers=_hf_headers(), timeout=30)
-        r.raise_for_status()
-        repos = []
-        for item in r.json():
-            repo_id = item.get("modelId") or item.get("id")
-            if not repo_id:
-                continue
-            lower = repo_id.lower()
-            tags = " ".join(item.get("tags", [])).lower()
-            if "gguf" in lower or "gguf" in tags:
-                repos.append({"id": repo_id, "downloads": item.get("downloads", 0)})
-        return jsonify({"ok": True, "repos": repos})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/models/hf_files", methods=["GET"])
-def hf_model_files():
-    repo = request.args.get("repo", "").strip()
-    if not repo:
-        return jsonify({"ok": False, "error": "Missing repo"}), 400
-    try:
-        files = _hf_gguf_files(repo)
-        for f in files:
-            f["size_text"] = _format_size(f.get("size"))
-        return jsonify({"ok": True, "files": files})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/models/download_hf", methods=["POST"])
-def download_hf_model_files():
-    data = request.get_json() or {}
-    repo = data.get("repo", "").strip()
-    files = data.get("files", [])
-    if not repo:
-        return jsonify({"ok": False, "error": "Missing repo"}), 400
-    if not files:
-        return jsonify({"ok": False, "error": "No files selected"}), 400
-    try:
-        available = {f["name"] for f in _hf_gguf_files(repo)}
-        invalid = [f for f in files if f not in available]
-        if invalid:
-            return jsonify({"ok": False, "error": f"Selected file not found in repo: {invalid[0]}"}), 400
-        paths = _download_hf_files(repo, files)
-        return jsonify({"ok": True, "repo": repo, "files": paths})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.route("/installer/detect_hardware", methods=["GET"])
 def detect_hardware():
     """Detect OS, architecture, and GPU for optimal binary selection."""
@@ -2176,31 +2186,6 @@ def get_releases():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/installer/auto_install", methods=["POST"])
-def auto_install_llama():
-    """Install the best matching prebuilt llama.cpp binary for this runtime."""
-    try:
-        r = requests.get(GITHUB_API_URL, timeout=15)
-        r.raise_for_status()
-        release = r.json()
-        hw = _detect_hardware()
-        best_asset, pattern = _match_release_asset(release.get("assets", []), hw)
-        if not best_asset:
-            return jsonify({"ok": False, "error": "No matching prebuilt binary found for this hardware."}), 404
-
-        success, result = _install_prebuilt_binary(best_asset, hw)
-        if not success:
-            return jsonify({"ok": False, "error": result}), 500
-        return jsonify({
-            "ok": True,
-            "path": result,
-            "asset": best_asset["name"],
-            "matched_pattern": pattern,
-            "hardware": hw,
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.route("/installer/install_prebuilt", methods=["POST"])
 def install_prebuilt():
     """Download and install a prebuilt llama.cpp binary."""
@@ -2238,7 +2223,179 @@ def install_prebuilt():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL DOWNLOADER UTILS & ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+def _download_hf_file(repo_id, filename):
+    dest_dir = os.path.abspath(state.config.get("model_dir", "./models"))
+    os.makedirs(dest_dir, exist_ok=True)
+    
+    if not shutil.which("aria2c"):
+        _log("Error: aria2c is not installed or not in PATH. Please install it first.")
+        return False
+        
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    _log(f"Starting download of {filename} from {repo_id}...")
+    _log(f"URL: {url}")
+    
+    cmd = [
+        "aria2c",
+        "-x", "16",
+        "-s", "16",
+        "-k", "1M",
+        "--summary-interval=1",
+        url,
+        "-d", dest_dir,
+        "-o", filename
+    ]
+    
+    try:
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+            
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=creation_flags
+        )
+        
+        for line in iter(process.stdout.readline, ''):
+            line_str = line.strip()
+            if line_str:
+                line_str = line_str.replace('\r', '\n').split('\n')[-1]
+                _log(f"[Download] {line_str}")
+                
+        process.stdout.close()
+        returncode = process.wait()
+        if returncode == 0:
+            _log(f"Successfully downloaded {filename} to {dest_dir}")
+            return True
+        else:
+            _log(f"aria2c failed with return code {returncode}")
+            return False
+    except Exception as e:
+        _log(f"Download error: {e}")
+        return False
+
+def _downloader_worker(repo_id, filename):
+    global state
+    state.downloader_running = True
+    try:
+        _download_hf_file(repo_id, filename)
+    finally:
+        state.downloader_running = False
+
+def _preset_downloader_worker(preset):
+    global state
+    state.downloader_running = True
+    try:
+        dest_dir = os.path.abspath(state.config.get("model_dir", "./models"))
+        if preset == "qwen":
+            repo_id = "Qwen/Qwen3-VL-8B-Instruct-GGUF"
+            model_file = "Qwen3VL-8B-Instruct-Q8_0.gguf"
+            mmproj_file = "mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+            
+            _log("Preset Download: Qwen 3 8B VL selected. Downloading model and projector...")
+            ok1 = _download_hf_file(repo_id, model_file)
+            if ok1:
+                _download_hf_file(repo_id, mmproj_file)
+        elif preset == "gemma":
+            repo_id = "unsloth/gemma-4-12b-it-GGUF"
+            model_file = "gemma-4-12b-it-Q8_0.gguf"
+            mmproj_file = "mmproj-F16.gguf"
+            
+            _log("Preset Download: Gemma 4 12B selected. Downloading model and projector...")
+            ok1 = _download_hf_file(repo_id, model_file)
+            if ok1:
+                _download_hf_file(repo_id, mmproj_file)
+    finally:
+        state.downloader_running = False
+
+@app.route("/downloader/search", methods=["GET"])
+def downloader_search():
+    query = request.args.get("query", "")
+    if not query:
+        return jsonify({"ok": False, "error": "Query is required"}), 400
+    try:
+        url = f"https://huggingface.co/api/models?search={query}&limit=20"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        
+        results = []
+        for item in data:
+            results.append({
+                "id": item.get("id"),
+                "downloads": item.get("downloads", 0)
+            })
+            
+        return jsonify({"ok": True, "results": results})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/downloader/files", methods=["GET"])
+def downloader_files():
+    repo_id = request.args.get("repo_id", "")
+    if not repo_id:
+        return jsonify({"ok": False, "error": "Repo ID is required"}), 400
+    try:
+        url = f"https://huggingface.co/api/models/{repo_id}"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        
+        files = [s["rfilename"] for s in data.get("siblings", [])]
+        allowed_exts = {".gguf", ".safetensors", ".bin", ".pt"}
+        filtered_files = [f for f in files if any(f.endswith(ext) for ext in allowed_exts) or "mmproj" in f.lower() or "projector" in f.lower()]
+        
+        return jsonify({"ok": True, "files": sorted(filtered_files)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/downloader/download_file", methods=["POST"])
+def downloader_download_file():
+    global state
+    if state.downloader_running:
+        return jsonify({"ok": False, "error": "Another download is already in progress."}), 409
+        
+    data = request.get_json()
+    repo_id = data.get("repo_id")
+    filename = data.get("filename")
+    
+    if not repo_id or not filename:
+        return jsonify({"ok": False, "error": "repo_id and filename are required"}), 400
+        
+    t = threading.Thread(target=_downloader_worker, args=(repo_id, filename), daemon=True)
+    t.start()
+    return jsonify({"ok": True})
+
+@app.route("/downloader/download_preset", methods=["POST"])
+def downloader_download_preset():
+    global state
+    if state.downloader_running:
+        return jsonify({"ok": False, "error": "Another download is already in progress."}), 409
+        
+    data = request.get_json()
+    preset = data.get("preset")
+    if preset not in ("qwen", "gemma"):
+        return jsonify({"ok": False, "error": "Invalid preset"}), 400
+        
+    t = threading.Thread(target=_preset_downloader_worker, args=(preset,), daemon=True)
+    t.start()
+    return jsonify({"ok": True})
+
+@app.route("/downloader/status", methods=["GET"])
+def downloader_status():
+    return jsonify({"running": state.downloader_running})
+
+
 if __name__ == "__main__":
+    _auto_setup_llama_binaries()
     print("\n" + "─"*52)
     print("  Dataset Captioner — Image Captioning Edition")
     print(f"  model  : {state.config['model_path']}")

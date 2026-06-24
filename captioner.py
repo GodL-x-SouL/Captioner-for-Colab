@@ -33,7 +33,10 @@ from PIL import Image as PILImage
 def _diag(msg):
     print(f"[DIAG] {msg}", flush=True)
 
-os.makedirs("./models", exist_ok=True)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(SCRIPT_DIR, "model")
+PROMPTS_DIR = os.path.join(SCRIPT_DIR, "prompts")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 def _check_llama_binary():
     """Check if llama-server is accessible."""
@@ -78,16 +81,16 @@ class AppState:
             "llama_server_bin": os.environ.get("LLAMA_SERVER_BIN", "llama-server"),
             "model_path": os.environ.get("LLAMA_MODEL", ""),
             "mmproj_path": os.environ.get("LLAMA_MMPROJ", ""),
-            "model_dir": "./models",
-            "mmproj_dir": "./models",
+            "model_dir": MODEL_DIR,
+            "mmproj_dir": MODEL_DIR,
             "port": int(os.environ.get("LLAMA_PORT", 8080)),
             "ctx_size": 16384,
             "gpu_layers": 99
         }
         self.stats_lock = threading.Lock()
         self._load_config()
-        self.config["model_dir"] = "./models"
-        self.config["mmproj_dir"] = "./models"
+        self.config["model_dir"] = MODEL_DIR
+        self.config["mmproj_dir"] = MODEL_DIR
         if not os.path.exists(CONFIG_FILE):
             self.save_config()
 
@@ -107,6 +110,16 @@ class AppState:
         
         self.completed_files = set()
         self.downloader_running = False
+        self.download_progress = {
+            "active": False,
+            "filename": "",
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed_bps": 0,
+            "eta_seconds": 0,
+            "percent": 0,
+            "status": "idle"
+        }
 
 state = AppState()
 
@@ -122,7 +135,11 @@ def _safe_get(cfg, key, default=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL UTILS
 # ─────────────────────────────────────────────────────────────────────────────
-def _scan_available_models(model_dir="./models", mmproj_dir="./models"):
+def _scan_available_models(model_dir=None, mmproj_dir=None):
+    if model_dir is None:
+        model_dir = MODEL_DIR
+    if mmproj_dir is None:
+        mmproj_dir = MODEL_DIR
     ggufs = []
     mmprojs = []
 
@@ -205,11 +222,8 @@ def _auto_setup_llama_binaries():
     if sys.platform == "win32":
         bin_name += ".exe"
 
-    # Use /content/llama_binaries on Linux (Colab), otherwise ./llama_binaries
-    if sys.platform == "linux":
-        bin_dir = "/content/llama_binaries"
-    else:
-        bin_dir = os.path.abspath("./llama_binaries")
+    # All binaries go into LLAMA_CPP_INSTALL_DIR so they live alongside llama.cpp source
+    bin_dir = LLAMA_CPP_INSTALL_DIR
     bin_path = os.path.join(bin_dir, bin_name)
 
     if os.path.exists(bin_path):
@@ -237,10 +251,9 @@ def _auto_setup_llama_binaries():
                     f.write(chunk)
 
         import tarfile
-        # Extract to /content so that llama_binaries/ folder lands at /content/llama_binaries/
-        extract_target = "/content" if sys.platform == "linux" else bin_dir
+        # Extract directly into llama.cpp directory so binaries and libs are colocated
         with tarfile.open(tmp_tar, 'r:gz') as tf:
-            tf.extractall(extract_target)
+            tf.extractall(bin_dir)
 
         if os.path.exists(bin_path):
             if sys.platform != "win32":
@@ -1282,9 +1295,28 @@ select.path-input{
   font-family:var(--font-mono);font-size:9px;letter-spacing:1px;
   text-transform:uppercase;color:var(--muted-4);margin-top:6px;
 }
+.toast-container{
+  position:fixed;top:20px;right:20px;z-index:9999;
+  display:flex;flex-direction:column;gap:8px;
+}
+.toast{
+  font-family:var(--font-mono);font-size:11px;font-weight:400;
+  padding:10px 16px;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--bg-card);
+  color:var(--ink);box-shadow:var(--shadow-md);
+  animation:toastIn 0.3s ease;max-width:350px;
+  transition:opacity 0.3s,transform 0.3s;
+}
+.toast.success{border-color:var(--success);color:var(--success);}
+.toast.error{border-color:var(--danger);color:var(--danger);}
+.toast.info{border-color:var(--accent);color:var(--accent);}
+.toast.fade-out{opacity:0;transform:translateX(20px);}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px);}to{opacity:1;transform:translateX(0);}}
 </style>
 </head>
 <body>
+
+<div class="toast-container" id="toast-container"></div>
 
 <div class="header-row">
   <div class="title-block">
@@ -1294,6 +1326,10 @@ select.path-input{
     <div class="subtitle">Image captioning studio powered by local LLM inference via llama-server.</div>
   </div>
   <div class="toolbar">
+    <div class="theme-toggle" onclick="refreshUI()" title="Refresh UI">
+      <span class="icon">&#8635;</span>
+      <span>Refresh</span>
+    </div>
     <div class="theme-toggle" onclick="toggleTheme()" title="Toggle AMOLED dark mode">
       <span class="icon" id="theme-icon">&#9790;</span>
       <span id="theme-label">Dark</span>
@@ -1451,6 +1487,21 @@ select.path-input{
       </div>
       
       <div id="download-progress-display" style="font-size:11px;color:var(--muted-2);margin-top:8px;"></div>
+      
+      <div id="dl-progress-container" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-soft);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-family:var(--font-mono);font-size:10px;font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.5px;" id="dl-filename">Downloading...</span>
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted-3);" id="dl-percent">0%</span>
+        </div>
+        <div class="progress-bar-bg" style="margin-bottom:8px;">
+          <div class="progress-bar-fill" id="dl-progress-fill" style="width:0%;background:var(--accent);transition:width 0.3s;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10px;color:var(--muted-3);">
+          <span id="dl-speed">Speed: --</span>
+          <span id="dl-downloaded">0 / 0</span>
+          <span id="dl-eta">ETA: --</span>
+        </div>
+      </div>
     </div></div>
   </div>
 </div>
@@ -1898,6 +1949,114 @@ async function onTrainingTypeChange(el){
 }
 
 window.onload=()=>{initPrompts();};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REFRESH UI
+// ─────────────────────────────────────────────────────────────────────────────
+function refreshUI(){
+  loadModels();
+  _initInstaller();
+  initPrompts();
+  showToast('UI refreshed', 'info');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOAST NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+function showToast(message, type='info', duration=4000){
+  const container=document.getElementById('toast-container');
+  if(!container)return;
+  const toast=document.createElement('div');
+  toast.className='toast '+type;
+  toast.textContent=message;
+  container.appendChild(toast);
+  setTimeout(()=>{
+    toast.classList.add('fade-out');
+    setTimeout(()=>toast.remove(),300);
+  },duration);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOWNLOAD PROGRESS POLLING
+// ─────────────────────────────────────────────────────────────────────────────
+let _dlProgressInterval=null;
+let _dlWasActive=false;
+
+function formatBytes(bytes){
+  if(bytes===0) return '0 B';
+  const k=1024;
+  const sizes=['B','KB','MB','GB'];
+  const i=Math.floor(Math.log(bytes)/Math.log(k));
+  return parseFloat((bytes/Math.pow(k,i)).toFixed(1))+' '+sizes[i];
+}
+
+function formatEta(seconds){
+  if(seconds<=0||seconds>86400) return '--';
+  if(seconds<60) return seconds+'s';
+  const m=Math.floor(seconds/60);
+  const s=seconds%60;
+  return m+'m '+s+'s';
+}
+
+function pollDownloadProgress(){
+  fetch('/downloader/progress').then(r=>r.json()).then(p=>{
+    const container=document.getElementById('dl-progress-container');
+    if(!container) return;
+    
+    if(p.active){
+      container.style.display='block';
+      _dlWasActive=true;
+      
+      document.getElementById('dl-filename').textContent='Downloading: '+p.filename;
+      document.getElementById('dl-percent').textContent=p.percent+'%';
+      document.getElementById('dl-progress-fill').style.width=p.percent+'%';
+      document.getElementById('dl-speed').textContent='Speed: '+formatBytes(p.speed_bps)+'/s';
+      document.getElementById('dl-downloaded').textContent=formatBytes(p.downloaded_bytes)+' / '+formatBytes(p.total_bytes);
+      document.getElementById('dl-eta').textContent='ETA: '+formatEta(p.eta_seconds);
+    } else {
+      if(_dlWasActive){
+        _dlWasActive=false;
+        if(p.status==='completed'){
+          showToast('Download completed: '+p.filename, 'success', 5000);
+          document.getElementById('dl-percent').textContent='100%';
+          document.getElementById('dl-progress-fill').style.width='100%';
+          document.getElementById('dl-eta').textContent='Done';
+          // Refresh model list
+          loadModels();
+          setTimeout(()=>{container.style.display='none';},3000);
+        } else if(p.status==='failed'){
+          showToast('Download failed: '+p.filename, 'error', 5000);
+          container.style.display='none';
+        } else {
+          container.style.display='none';
+        }
+      }
+    }
+  }).catch(e=>{});
+}
+
+function startDlProgressPolling(){
+  if(_dlProgressInterval) return;
+  _dlProgressInterval=setInterval(pollDownloadProgress,1000);
+}
+
+// Start polling immediately
+startDlProgressPolling();
+
+// Also trigger notification when download starts via preset/HF buttons
+const origDownloadPreset=downloadPreset;
+downloadPreset=function(name){
+  showToast('Starting download: '+name+' model...', 'info');
+  startDlProgressPolling();
+  return origDownloadPreset(name);
+};
+
+const origDownloadHFFile=downloadHFFile;
+downloadHFFile=function(repoId,filename){
+  showToast('Starting download: '+filename, 'info');
+  startDlProgressPolling();
+  return origDownloadHFFile(repoId,filename);
+};
 </script>
 </body>
 </html>"""
@@ -1906,11 +2065,10 @@ _batch_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batc
 
 @app.route("/prompts", methods=["GET"])
 def get_prompts():
-    prompts_dir = "prompts"
-    if not os.path.exists(prompts_dir):
+    if not os.path.exists(PROMPTS_DIR):
         return jsonify({"ok": False, "error": "Prompts directory not found"}), 404
     try:
-        files = [os.path.splitext(f)[0] for f in os.listdir(prompts_dir) if f.endswith(".txt")]
+        files = [os.path.splitext(f)[0] for f in os.listdir(PROMPTS_DIR) if f.endswith(".txt")]
         return jsonify({"ok": True, "prompts": sorted(files)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1920,8 +2078,7 @@ def get_prompt_content():
     prompt_name = request.args.get("name")
     if not prompt_name:
         return jsonify({"ok": False, "error": "Missing prompt name"}), 400
-    prompts_dir = "prompts"
-    file_path = os.path.join(prompts_dir, f"{prompt_name}.txt")
+    file_path = os.path.join(PROMPTS_DIR, f"{prompt_name}.txt")
     if not os.path.exists(file_path):
         return jsonify({"ok": False, "error": "Prompt file not found"}), 404
     try:
@@ -2047,8 +2204,8 @@ def test_single():
 
 @app.route("/models", methods=["GET"])
 def get_models():
-    model_dir = request.args.get("model_dir", state.config.get("model_dir", "./models"))
-    mmproj_dir = request.args.get("mmproj_dir", state.config.get("mmproj_dir", "./models"))
+    model_dir = request.args.get("model_dir", state.config.get("model_dir", MODEL_DIR))
+    mmproj_dir = request.args.get("mmproj_dir", state.config.get("mmproj_dir", MODEL_DIR))
 
     available = _scan_available_models(model_dir=model_dir, mmproj_dir=mmproj_dir)
     return jsonify({
@@ -2056,8 +2213,8 @@ def get_models():
         "current": {
             "model": state.config["model_path"],
             "mmproj": state.config["mmproj_path"],
-            "model_dir": state.config.get("model_dir", "./models"),
-            "mmproj_dir": state.config.get("mmproj_dir", "./models"),
+            "model_dir": state.config.get("model_dir", MODEL_DIR),
+            "mmproj_dir": state.config.get("mmproj_dir", MODEL_DIR),
             "llama_server_bin": state.config.get("llama_server_bin", "llama-server"),
             "is_running": state.is_server_running
         }
@@ -2235,7 +2392,7 @@ def install_prebuilt():
 # MODEL DOWNLOADER UTILS & ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _download_hf_file(repo_id, filename):
-    dest_dir = os.path.abspath(state.config.get("model_dir", "./models"))
+    dest_dir = os.path.abspath(state.config.get("model_dir", MODEL_DIR))
     os.makedirs(dest_dir, exist_ok=True)
     
     if not shutil.which("aria2c"):
@@ -2246,12 +2403,26 @@ def _download_hf_file(repo_id, filename):
     _log(f"Starting download of {filename} from {repo_id}...")
     _log(f"URL: {url}")
     
+    # Initialize progress tracking
+    with state.stats_lock:
+        state.download_progress.update({
+            "active": True,
+            "filename": filename,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed_bps": 0,
+            "eta_seconds": 0,
+            "percent": 0,
+            "status": "downloading"
+        })
+    
     cmd = [
         "aria2c",
         "-x", "16",
         "-s", "16",
         "-k", "1M",
         "--summary-interval=1",
+        "--enable-color-rx=\\[\\K[0-9.]+%(,|\\])",
         url,
         "-d", dest_dir,
         "-o", filename
@@ -2276,17 +2447,69 @@ def _download_hf_file(repo_id, filename):
             if line_str:
                 line_str = line_str.replace('\r', '\n').split('\n')[-1]
                 _log(f"[Download] {line_str}")
+                # Parse aria2c progress output
+                import re as _re
+                # Match patterns like: [  1.2MiB/5.0MiB(24%) CN:16 DL:1.2MiB/s ETA:3s
+                m = _re.search(r'\[([\d.]+)([A-Za-z]+)/([\d.]+)([A-Za-z]+)\((\d+)%\).*?DL:([\d.]+)([A-Za-z]+)/s.*?ETA:(\d+)([a-z]*)', line_str)
+                if m:
+                    downloaded = float(m.group(1))
+                    dl_unit = m.group(2)
+                    total = float(m.group(3))
+                    tot_unit = m.group(4)
+                    pct = int(m.group(5))
+                    speed = float(m.group(6))
+                    speed_unit = m.group(7)
+                    eta = int(m.group(8))
+                    eta_unit = m.group(9)
+                    
+                    # Convert to bytes
+                    unit_mult = {"B": 1, "KiB": 1024, "MiB": 1024*1024, "GiB": 1024*1024*1024}
+                    dl_bytes = downloaded * unit_mult.get(dl_unit, 1)
+                    tot_bytes = total * unit_mult.get(tot_unit, 1)
+                    speed_bytes = speed * unit_mult.get(speed_unit, 1)
+                    eta_secs = eta * (60 if eta_unit == "m" else 1)
+                    
+                    with state.stats_lock:
+                        state.download_progress.update({
+                            "downloaded_bytes": int(dl_bytes),
+                            "total_bytes": int(tot_bytes),
+                            "speed_bps": int(speed_bytes),
+                            "eta_seconds": eta_secs,
+                            "percent": pct
+                        })
+                elif '%' in line_str:
+                    # Fallback: try to match simpler percentage patterns
+                    m2 = _re.search(r'(\d+)%', line_str)
+                    if m2:
+                        with state.stats_lock:
+                            state.download_progress["percent"] = int(m2.group(1))
                 
         process.stdout.close()
         returncode = process.wait()
         if returncode == 0:
             _log(f"Successfully downloaded {filename} to {dest_dir}")
+            with state.stats_lock:
+                state.download_progress.update({
+                    "active": False,
+                    "status": "completed",
+                    "percent": 100
+                })
             return True
         else:
             _log(f"aria2c failed with return code {returncode}")
+            with state.stats_lock:
+                state.download_progress.update({
+                    "active": False,
+                    "status": "failed"
+                })
             return False
     except Exception as e:
         _log(f"Download error: {e}")
+        with state.stats_lock:
+            state.download_progress.update({
+                "active": False,
+                "status": "failed"
+            })
         return False
 
 def _downloader_worker(repo_id, filename):
@@ -2301,7 +2524,7 @@ def _preset_downloader_worker(preset):
     global state
     state.downloader_running = True
     try:
-        dest_dir = os.path.abspath(state.config.get("model_dir", "./models"))
+        dest_dir = os.path.abspath(state.config.get("model_dir", MODEL_DIR))
         if preset == "qwen":
             repo_id = "Qwen/Qwen3-VL-8B-Instruct-GGUF"
             model_file = "Qwen3VL-8B-Instruct-Q8_0.gguf"
@@ -2399,6 +2622,11 @@ def downloader_download_preset():
 @app.route("/downloader/status", methods=["GET"])
 def downloader_status():
     return jsonify({"running": state.downloader_running})
+
+@app.route("/downloader/progress", methods=["GET"])
+def downloader_progress():
+    with state.stats_lock:
+        return jsonify(state.download_progress.copy())
 
 
 if __name__ == "__main__":

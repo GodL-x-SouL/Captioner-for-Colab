@@ -276,9 +276,38 @@ def _auto_setup_llama_binaries():
                     f.write(chunk)
 
         import tarfile
-        # Extract directly into llama.cpp directory so binaries and libs are colocated
+        # Tarball contains a llama.cpp/ folder — extract to temp, then flatten into bin_dir
+        tmp_extract = os.path.join(tempfile.gettempdir(), "llama_extract_tmp")
+        if os.path.exists(tmp_extract):
+            shutil.rmtree(tmp_extract)
+        os.makedirs(tmp_extract, exist_ok=True)
         with tarfile.open(tmp_tar, 'r:gz') as tf:
-            tf.extractall(bin_dir)
+            tf.extractall(tmp_extract, filter='data')
+        # Find the inner llama.cpp/ folder and move its contents to bin_dir
+        inner_cpp = os.path.join(tmp_extract, "llama.cpp")
+        if os.path.isdir(inner_cpp):
+            for item in os.listdir(inner_cpp):
+                src = os.path.join(inner_cpp, item)
+                dst = os.path.join(bin_dir, item)
+                if os.path.exists(dst):
+                    if os.path.isdir(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.remove(dst)
+                shutil.move(src, dst)
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+        else:
+            # Fallback: contents extracted directly into tmp_extract, move them
+            for item in os.listdir(tmp_extract):
+                src = os.path.join(tmp_extract, item)
+                dst = os.path.join(bin_dir, item)
+                if os.path.exists(dst):
+                    if os.path.isdir(dst):
+                        shutil.rmtree(dst)
+                    else:
+                        os.remove(dst)
+                shutil.move(src, dst)
+            shutil.rmtree(tmp_extract, ignore_errors=True)
 
         if os.path.exists(bin_path):
             if sys.platform != "win32":
@@ -443,278 +472,7 @@ def _stop_llama_server():
 # ─────────────────────────────────────────────────────────────────────────────
 # LLAMA.CPP INSTALLER — Hardware Detection & Binary Download
 # ─────────────────────────────────────────────────────────────────────────────
-import platform
-import struct
-
 LLAMA_CPP_INSTALL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama.cpp")
-GITHUB_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-
-def _detect_hardware():
-    """Detect OS, architecture, and GPU vendor for optimal binary selection."""
-    info = {
-        "os": sys.platform,
-        "os_name": "Unknown",
-        "arch": platform.machine().lower(),
-        "arch_name": "Unknown",
-        "gpu_vendor": "None",
-        "gpu_name": "Unknown",
-        "cuda_version": None,
-    }
-
-    # OS detection
-    if sys.platform == "win32":
-        info["os_name"] = "Windows"
-    elif sys.platform == "linux":
-        info["os_name"] = "Linux"
-    elif sys.platform == "darwin":
-        info["os_name"] = "macOS"
-    else:
-        info["os_name"] = sys.platform
-
-    # Architecture detection
-    machine = info["arch"]
-    if machine in ("x86_64", "amd64", "x64"):
-        info["arch_name"] = "x64"
-    elif machine in ("aarch64", "arm64"):
-        info["arch_name"] = "arm64"
-    elif machine in ("i386", "i686", "x86"):
-        info["arch_name"] = "x64"  # Treat x86 as x64 for downloads
-    else:
-        info["arch_name"] = machine
-
-    # GPU detection — NVIDIA (CUDA)
-    if sys.platform == "win32":
-        try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=gpu_name,driver_version", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                line = r.stdout.strip().split("\n")[0]
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 1:
-                    info["gpu_name"] = parts[0]
-                    info["gpu_vendor"] = "NVIDIA"
-                if len(parts) >= 2:
-                    # Try to get CUDA version from nvidia-smi
-                    r2 = subprocess.run(
-                        ["nvidia-smi"], capture_output=True, text=True, timeout=5,
-                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-                    )
-                    if r2.returncode == 0:
-                        import re as _re
-                        m = _re.search(r"CUDA Version:\s*([\d.]+)", r2.stdout)
-                        if m:
-                            info["cuda_version"] = m.group(1)
-        except Exception:
-            pass
-    elif sys.platform == "linux":
-        try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=gpu_name,driver_version", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                line = r.stdout.strip().split("\n")[0]
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 1:
-                    info["gpu_name"] = parts[0]
-                    info["gpu_vendor"] = "NVIDIA"
-                if len(parts) >= 2:
-                    r2 = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
-                    if r2.returncode == 0:
-                        import re as _re
-                        m = _re.search(r"CUDA Version:\s*([\d.]+)", r2.stdout)
-                        if m:
-                            info["cuda_version"] = m.group(1)
-        except Exception:
-            pass
-
-    # GPU detection — AMD (ROCm) — Linux only
-    if sys.platform == "linux" and info["gpu_vendor"] == "None":
-        try:
-            r = subprocess.run(
-                ["rocm-smi", "--showproductname"], capture_output=True, text=True, timeout=5
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                for line in r.stdout.strip().split("\n"):
-                    if "GPU" in line and ":" in line:
-                        info["gpu_name"] = line.split(":", 1)[-1].strip()
-                        info["gpu_vendor"] = "AMD"
-                        break
-        except Exception:
-            pass
-
-    # GPU detection — Intel (OpenVINO/SYCL)
-    if sys.platform in ("win32", "linux") and info["gpu_vendor"] == "None":
-        try:
-            if sys.platform == "win32":
-                r = subprocess.run(
-                    ["wmic", "path", "win32_videocontroller", "get", "name"],
-                    capture_output=True, text=True, timeout=5,
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-                )
-            else:
-                r = subprocess.run(
-                    ["lspci"], capture_output=True, text=True, timeout=5
-                )
-            if r.returncode == 0 and r.stdout.strip():
-                for line in r.stdout.strip().split("\n"):
-                    lower = line.lower()
-                    if "intel" in lower and ("arc" in lower or "iris" in lower or "uhd" in lower or "hd graphics" in lower):
-                        info["gpu_name"] = line.strip()
-                        info["gpu_vendor"] = "Intel"
-                        break
-        except Exception:
-            pass
-
-    return info
-
-def _match_release_asset(assets, hw_info):
-    """Match the best release asset for the detected hardware."""
-    os_name = hw_info["os_name"]
-    arch = hw_info["arch_name"]
-    gpu = hw_info["gpu_vendor"]
-    cuda_ver = hw_info.get("cuda_version")
-
-    # Build a priority list of patterns to match
-    patterns = []
-
-    if os_name == "Windows":
-        if gpu == "NVIDIA":
-            # Try to match exact CUDA version, then fallback to latest CUDA
-            if cuda_ver:
-                cuda_major = cuda_ver.split(".")[0]
-                # Try matching CUDA major version
-                patterns.append(f"win-cuda-{cuda_ver[:4]}-x64")
-                patterns.append(f"win-cuda-{cuda_major}-x64")
-            patterns.append("win-cuda-13.3-x64")  # Latest CUDA
-            patterns.append("win-cuda-12.4-x64")
-        elif gpu == "AMD":
-            patterns.append("win-hip-radeon-x64")
-        elif gpu == "Intel":
-            patterns.append("win-sycl-x64")
-            patterns.append("win-openvino-2026.2-x64")
-        # CPU fallback
-        patterns.append(f"win-cpu-{arch}")
-
-    elif os_name == "Linux":
-        if gpu == "NVIDIA":
-            if cuda_ver:
-                cuda_major = cuda_ver.split(".")[0]
-                patterns.append(f"ubuntu-cuda-{cuda_ver[:4]}-x64")
-                patterns.append(f"ubuntu-cuda-{cuda_major}-x64")
-            patterns.append("ubuntu-cuda-12.4-x64")
-            patterns.append("ubuntu-cuda-13.3-x64")
-        elif gpu == "AMD":
-            patterns.append("ubuntu-rocm-7.2-x64")
-        patterns.append(f"ubuntu-vulkan-{arch}")
-        patterns.append(f"ubuntu-x64")  # CPU fallback
-
-    elif os_name == "macOS":
-        patterns.append(f"macos-{arch}")
-        patterns.append(f"macos-x64")
-
-    # Score and rank assets
-    scored = []
-    for asset in assets:
-        name = asset["name"].lower()
-        # Skip non-binary assets
-        if not name.endswith((".zip", ".tar.gz")):
-            continue
-        if "ui" in name or "xcframework" in name:
-            continue
-
-        score = 0
-        matched_pattern = None
-        for i, pat in enumerate(patterns):
-            if pat.lower() in name:
-                score = len(patterns) - i  # Earlier patterns score higher
-                matched_pattern = pat
-                break
-
-        if score > 0:
-            scored.append((score, asset, matched_pattern))
-
-    if not scored:
-        return None, None
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1], scored[0][2]
-
-def _install_prebuilt_binary(asset, hw_info):
-    """Download and extract a prebuilt binary from a GitHub release asset."""
-    url = asset["browser_download_url"]
-    name = asset["name"]
-    install_dir = LLAMA_CPP_INSTALL_DIR
-
-    _log(f"  Downloading {name}...")
-    _log(f"  URL: {url}")
-
-    os.makedirs(install_dir, exist_ok=True)
-
-    tmp_path = os.path.join(tempfile.gettempdir(), name)
-
-    try:
-        # Download with progress
-        r = requests.get(url, stream=True, timeout=300)
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(tmp_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = (downloaded / total) * 100
-                    if downloaded % (10 * 1024 * 1024) < 1024 * 1024:
-                        _log(f"  Download progress: {pct:.0f}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
-
-        _log(f"  Download complete: {downloaded // (1024*1024)}MB")
-
-        # Extract
-        _log(f"  Extracting to {install_dir}...")
-        if name.endswith(".zip"):
-            import zipfile
-            with zipfile.ZipFile(tmp_path, 'r') as zf:
-                zf.extractall(install_dir)
-        elif name.endswith(".tar.gz"):
-            import tarfile
-            with tarfile.open(tmp_path, 'r:gz') as tf:
-                tf.extractall(install_dir)
-
-        _log(f"  Extraction complete.")
-
-        # Find llama-server binary in extracted files
-        bin_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
-        found_bin = None
-        for root, dirs, files in os.walk(install_dir):
-            for f in files:
-                if f == bin_name or f == "llama-server.exe":
-                    found_bin = os.path.join(root, f)
-                    break
-            if found_bin:
-                break
-
-        if found_bin:
-            _log(f"  Found binary: {found_bin}")
-            # Update config
-            state.config["llama_server_bin"] = found_bin
-            state.save_config()
-            return True, found_bin
-        else:
-            _log(f"  Warning: {bin_name} not found in extracted files.")
-            return False, f"Binary {bin_name} not found in archive"
-
-    except Exception as e:
-        _log(f"  Installation failed: {e}")
-        return False, str(e)
-    finally:
-        # Cleanup temp file
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1444,30 +1202,7 @@ select.path-input{
 
 <!-- MODELS TAB -->
 <div class="tab-panel" id="panel-models">
-  <div class="section-title">llama.cpp Installer</div>
-  <div class="layout">
-    <div class="card"><div class="section">
-      <div class="slabel">System Info</div>
-      <div id="hw-info" style="font-size:11px;color:var(--muted-2);margin-bottom:12px;">Detecting hardware...</div>
-
-      <div id="install-status" style="font-size:11px;color:var(--muted-2);margin-bottom:12px;"></div>
-
-      <div style="display:flex;gap:8px;margin-bottom:12px;">
-        <button class="btn-primary" id="btn-fetch-releases" onclick="fetchReleases()" style="width:100%;">Check for Prebuilt Binaries</button>
-      </div>
-
-      <div id="releases-section" style="display:none;">
-        <div class="slabel">Recommended Binary</div>
-        <div id="recommended-binary" style="font-size:11px;color:var(--muted-2);margin-bottom:8px;"></div>
-        <button class="btn-primary" id="btn-install-recommended" onclick="installRecommended()" style="width:100%;margin-bottom:12px;" disabled>Install Recommended Binary</button>
-
-        <div class="slabel">All Available Binaries</div>
-        <div id="all-binaries" style="max-height:200px;overflow-y:auto;margin-bottom:8px;"></div>
-      </div>
-    </div></div>
-  </div>
-
-  <div class="section-title" style="margin-top:24px;">Model Configuration</div>
+  <div class="section-title">Model Configuration</div>
   <div class="layout">
     <div class="card"><div class="section">
       <div class="slabel">Status</div>
@@ -1562,7 +1297,7 @@ function switchTab(name){
     const panel=document.getElementById('panel-'+t);
     if(btn&&panel){btn.classList.toggle('active',t===name);panel.classList.toggle('active',t===name);}
   });
-  if(name==='models'){loadModels();_initInstaller();}
+  if(name==='models'){loadModels();}
 }
 
 const I={system_prompt:'',trigger:'',skip_existing:true};
@@ -1698,117 +1433,6 @@ function _updateDot(running){
   if(t)t.textContent='llama-server: '+(running?'running':'stopped');
 }
 setInterval(()=>{fetch('/status').then(r=>r.json()).then(d=>_updateDot(d.running));},3000);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LLAMA.CPP INSTALLER JS
-// ─────────────────────────────────────────────────────────────────────────────
-let _hwInfo = null;
-let _recommendedAsset = null;
-
-async function detectHardware(){
-  try{
-    const res = await fetch('/installer/detect_hardware');
-    const data = await res.json();
-    if(data.ok){
-      _hwInfo = data.hardware;
-      const hw = data.hardware;
-      let html = `<strong>${hw.os_name}</strong> &middot; <strong>${hw.arch_name}</strong>`;
-      if(hw.gpu_vendor !== 'None'){
-        html += ` &middot; <strong>${hw.gpu_vendor}</strong>: ${hw.gpu_name}`;
-        if(hw.cuda_version) html += ` (CUDA ${hw.cuda_version})`;
-      } else {
-        html += ` &middot; CPU only`;
-      }
-      document.getElementById('hw-info').innerHTML = html;
-
-      if(data.installed){
-        document.getElementById('install-status').innerHTML = '<span style="color:var(--success);">&#10003; llama-server installed</span>';
-      } else {
-        document.getElementById('install-status').innerHTML = '<span style="color:var(--danger);">&#10007; llama-server not found</span>';
-      }
-    }
-  } catch(e){
-    document.getElementById('hw-info').textContent = 'Error detecting hardware: ' + e;
-  }
-}
-
-async function fetchReleases(){
-  const btn = document.getElementById('btn-fetch-releases');
-  btn.disabled = true; btn.textContent = 'Loading...';
-  try{
-    const res = await fetch('/installer/releases');
-    const data = await res.json();
-    if(!data.ok){ alert('Error: ' + data.error); return; }
-
-    const hw = data.hardware;
-    document.getElementById('hw-info').innerHTML += `<br>Latest release: <strong>${data.version}</strong>`;
-
-    // Show recommended
-    const rec = data.recommended;
-    const recDiv = document.getElementById('recommended-binary');
-    if(rec.name){
-      recDiv.innerHTML = `<strong>${rec.name}</strong><br><span style="font-size:10px;">${rec.size_mb} MB &middot; Matched: ${rec.matched_pattern}</span>`;
-      _recommendedAsset = rec;
-      document.getElementById('btn-install-recommended').disabled = false;
-    } else {
-      recDiv.innerHTML = '<span style="color:var(--muted-3);">No matching binary found for your hardware.</span>';
-    }
-
-    // Show all available
-    const binDiv = document.getElementById('all-binaries');
-    let html = '<table style="width:100%;font-size:10px;border-collapse:collapse;">';
-    html += '<tr style="color:var(--muted-3);text-align:left;border-bottom:1px solid var(--border);"><th style="padding:4px 6px;">Name</th><th style="padding:4px 6px;">Size</th><th style="padding:4px 6px;"></th></tr>';
-    data.available.forEach(b => {
-      const isRec = rec.name === b.name;
-      html += `<tr style="border-bottom:1px solid var(--border-soft);${isRec?'background:var(--accent-soft);':''}">`;
-      html += `<td style="padding:4px 6px;word-break:break-all;">${b.name}</td>`;
-      html += `<td style="padding:4px 6px;white-space:nowrap;">${b.size_mb} MB</td>`;
-      html += `<td style="padding:4px 6px;white-space:nowrap;"><button class="btn" onclick="installBinary('${b.name}','${b.url}')" style="padding:2px 8px;">Install</button></td>`;
-      html += '</tr>';
-    });
-    html += '</table>';
-    binDiv.innerHTML = html;
-
-    document.getElementById('releases-section').style.display = 'block';
-  } catch(e){
-    alert('Failed to fetch releases: ' + e);
-  } finally {
-    btn.disabled = false; btn.textContent = 'Check for Prebuilt Binaries';
-  }
-}
-
-async function installRecommended(){
-  if(!_recommendedAsset){ return; }
-  await installBinary(_recommendedAsset.name, _recommendedAsset.url);
-}
-
-async function installBinary(name, url){
-  const btn = document.getElementById('btn-install-recommended');
-  btn.disabled = true; btn.textContent = 'Installing...';
-  document.getElementById('install-status').innerHTML = '<span style="color:var(--accent);">Downloading ' + name + '...</span>';
-  try{
-    const res = await fetch('/installer/install_prebuilt', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({asset_name: name, asset_url: url})
-    });
-    const data = await res.json();
-    if(data.ok){
-      document.getElementById('install-status').innerHTML = '<span style="color:var(--success);">&#10003; Installed: ' + name + '</span>';
-      detectHardware();
-    } else {
-      document.getElementById('install-status').innerHTML = '<span style="color:var(--danger);">&#10007; Install failed: ' + data.error + '</span>';
-    }
-  } catch(e){
-    document.getElementById('install-status').innerHTML = '<span style="color:var(--danger);">&#10007; Error: ' + e + '</span>';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Install Recommended Binary';
-  }
-}
-
-// Initialize hardware detection when Models tab is opened
-function _initInstaller(){
-  detectHardware();
-}
 
 async function loadModels(){
   const ms=document.getElementById('model-select');const ps=document.getElementById('mmproj-select');
@@ -1968,7 +1592,7 @@ async function downloadHFFile(repoId, filename) {
   }
 }
 
-if(document.getElementById('tb-models').classList.contains('active')){loadModels();_initInstaller();}
+if(document.getElementById('tb-models').classList.contains('active')){loadModels();}
 
 async function initPrompts(){
   try{const res=await fetch('/prompts');const data=await res.json();
@@ -1990,7 +1614,6 @@ window.onload=()=>{initPrompts();};
 // ─────────────────────────────────────────────────────────────────────────────
 function refreshUI(){
   loadModels();
-  _initInstaller();
   initPrompts();
   showToast('UI refreshed', 'info');
 }
@@ -2314,113 +1937,6 @@ def set_model():
         return jsonify({"ok": False, "error": status_msg}), 500
 
     return jsonify({"ok": True, "message": f"Server restarted with {os.path.basename(new_model)}"})
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLAMA.CPP INSTALLER API
-# ─────────────────────────────────────────────────────────────────────────────
-@app.route("/installer/detect_hardware", methods=["GET"])
-def detect_hardware():
-    """Detect OS, architecture, and GPU for optimal binary selection."""
-    hw = _detect_hardware()
-    # Check if llama.cpp is already installed
-    bin_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
-    installed = False
-    installed_path = None
-    for root, dirs, files in os.walk(LLAMA_CPP_INSTALL_DIR):
-        for f in files:
-            if f == bin_name or f == "llama-server.exe":
-                installed_path = os.path.join(root, f)
-                installed = True
-                break
-        if installed:
-            break
-
-    return jsonify({
-        "ok": True,
-        "hardware": hw,
-        "installed": installed,
-        "installed_path": installed_path,
-        "install_dir": LLAMA_CPP_INSTALL_DIR
-    })
-
-@app.route("/installer/releases", methods=["GET"])
-def get_releases():
-    """Fetch latest llama.cpp release and match best binary for this hardware."""
-    try:
-        r = requests.get(GITHUB_API_URL, timeout=15)
-        r.raise_for_status()
-        release = r.json()
-
-        hw = _detect_hardware()
-        assets = release.get("assets", [])
-        best_asset, pattern = _match_release_asset(assets, hw)
-
-        # Build full list of available binaries
-        available = []
-        for asset in assets:
-            name = asset["name"]
-            if not name.endswith((".zip", ".tar.gz")):
-                continue
-            if "ui" in name or "xcframework" in name:
-                continue
-            available.append({
-                "name": name,
-                "url": asset["browser_download_url"],
-                "size_mb": round(asset["size"] / (1024 * 1024), 1),
-                "downloads": asset.get("download_count", 0),
-            })
-
-        return jsonify({
-            "ok": True,
-            "version": release.get("tag_name", "unknown"),
-            "hardware": hw,
-            "recommended": {
-                "name": best_asset["name"] if best_asset else None,
-                "url": best_asset["browser_download_url"] if best_asset else None,
-                "size_mb": round(best_asset["size"] / (1024 * 1024), 1) if best_asset else None,
-                "matched_pattern": pattern,
-            },
-            "available": sorted(available, key=lambda x: x["name"]),
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/installer/install_prebuilt", methods=["POST"])
-def install_prebuilt():
-    """Download and install a prebuilt llama.cpp binary."""
-    data = request.get_json()
-    asset_name = data.get("asset_name")
-    asset_url = data.get("asset_url")
-
-    if not asset_url:
-        return jsonify({"ok": False, "error": "Missing asset URL"}), 400
-
-    # Fetch release to find the asset
-    try:
-        r = requests.get(GITHUB_API_URL, timeout=15)
-        r.raise_for_status()
-        release = r.json()
-        assets = release.get("assets", [])
-
-        asset = None
-        for a in assets:
-            if a["browser_download_url"] == asset_url or a["name"] == asset_name:
-                asset = a
-                break
-
-        if not asset:
-            return jsonify({"ok": False, "error": f"Asset not found: {asset_name}"}), 404
-
-        hw = _detect_hardware()
-        success, result = _install_prebuilt_binary(asset, hw)
-
-        if success:
-            return jsonify({"ok": True, "path": result, "message": f"Installed {asset['name']}"})
-        else:
-            return jsonify({"ok": False, "error": result}), 500
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

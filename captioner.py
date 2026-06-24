@@ -380,7 +380,13 @@ def _start_llama_server(config_override=None):
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NO_WINDOW
 
-        state.server_process = subprocess.Popen(cmd, stdout=lf, stderr=lf, creationflags=creation_flags)
+        # Set LD_LIBRARY_PATH to include the binary's directory so shared libs are found
+        env = os.environ.copy()
+        bin_dir = os.path.dirname(os.path.abspath(resolved_bin))
+        existing_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = bin_dir + (":" + existing_ld if existing_ld else "")
+
+        state.server_process = subprocess.Popen(cmd, stdout=lf, stderr=lf, creationflags=creation_flags, env=env)
     except FileNotFoundError as e:
         return (
             f"Cannot start llama-server: {e}\n"

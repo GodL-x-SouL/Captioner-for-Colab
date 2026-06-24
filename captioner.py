@@ -214,7 +214,7 @@ def _auto_setup_llama_binaries():
         return True
 
     _log("Auto-setup: Optimized T4 llama-server binary not found. Initiating automatic setup...")
-    url = "https://github.com/GodL-x-SouL/Captioner-for-Colab/releases/download/v1.0/llama_binaries.zip"
+    url = "https://github.com/GodL-x-SouL/Captioner-for-Colab/releases/download/v1.0/llama-b9763-bin-linux-cuda-x64.tar.gz"
     os.makedirs(bin_dir, exist_ok=True)
     tmp_zip = os.path.join(tempfile.gettempdir(), "llama_binaries.zip")
 

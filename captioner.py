@@ -201,10 +201,15 @@ def _resolve_llama_server_bin():
 
 def _auto_setup_llama_binaries():
     """Automatically downloads and configures the optimized llama-server binary for Colab/T4."""
-    bin_dir = os.path.abspath("./llama_binaries")
     bin_name = "llama-server"
     if sys.platform == "win32":
         bin_name += ".exe"
+
+    # Use /content/llama_binaries on Linux (Colab), otherwise ./llama_binaries
+    if sys.platform == "linux":
+        bin_dir = "/content/llama_binaries"
+    else:
+        bin_dir = os.path.abspath("./llama_binaries")
     bin_path = os.path.join(bin_dir, bin_name)
 
     if os.path.exists(bin_path):
@@ -216,24 +221,26 @@ def _auto_setup_llama_binaries():
     _log("Auto-setup: Optimized T4 llama-server binary not found. Initiating automatic setup...")
     url = "https://github.com/GodL-x-SouL/Captioner-for-Colab/releases/download/v1.0/llama-b9763-bin-linux-cuda-x64.tar.gz"
     os.makedirs(bin_dir, exist_ok=True)
-    tmp_zip = os.path.join(tempfile.gettempdir(), "llama_binaries.zip")
+    tmp_tar = os.path.join(tempfile.gettempdir(), "llama_binaries.tar.gz")
 
     try:
         if shutil.which("aria2c"):
             _log("Auto-setup: using aria2c for fast download...")
-            cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", url, "-d", tempfile.gettempdir(), "-o", "llama_binaries.zip"]
+            cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", url, "-d", tempfile.gettempdir(), "-o", "llama_binaries.tar.gz"]
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             _log("Auto-setup: aria2c not found, falling back to requests...")
             r = requests.get(url, stream=True, timeout=120)
             r.raise_for_status()
-            with open(tmp_zip, "wb") as f:
+            with open(tmp_tar, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-        import zipfile
-        with zipfile.ZipFile(tmp_zip, 'r') as zf:
-            zf.extractall(bin_dir)
+        import tarfile
+        # Extract to /content so that llama_binaries/ folder lands at /content/llama_binaries/
+        extract_target = "/content" if sys.platform == "linux" else bin_dir
+        with tarfile.open(tmp_tar, 'r:gz') as tf:
+            tf.extractall(extract_target)
 
         if os.path.exists(bin_path):
             if sys.platform != "win32":
@@ -243,15 +250,15 @@ def _auto_setup_llama_binaries():
             _log(f"Auto-setup: Successfully installed and configured llama-server binary at {bin_path}")
             return True
         else:
-            _log("Auto-setup error: llama-server binary not found in extracted zip files.")
+            _log(f"Auto-setup error: llama-server binary not found at {bin_path} after extraction.")
             return False
     except Exception as e:
         _log(f"Auto-setup failed: {e}")
         return False
     finally:
-        if os.path.exists(tmp_zip):
+        if os.path.exists(tmp_tar):
             try:
-                os.remove(tmp_zip)
+                os.remove(tmp_tar)
             except:
                 pass
 

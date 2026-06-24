@@ -180,7 +180,7 @@ def _llama_running():
         return False
 
 def _resolve_llama_server_bin():
-    """Resolve the llama-server binary path for Windows."""
+    """Resolve the llama-server binary path."""
     raw = state.config.get("llama_server_bin", "llama-server")
 
     # If it's already an absolute path to a file that exists, use it
@@ -199,19 +199,33 @@ def _resolve_llama_server_bin():
             if found:
                 return found
 
-        # Try common locations relative to the script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates = [
-            os.path.join(script_dir, raw),
-            os.path.join(script_dir, raw + ".exe"),
-            os.path.join(script_dir, "llama", raw),
-            os.path.join(script_dir, "llama", raw + ".exe"),
-            os.path.join(script_dir, "bin", raw),
-            os.path.join(script_dir, "bin", raw + ".exe"),
-        ]
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
+    # Search LLAMA_CPP_INSTALL_DIR recursively for llama-server
+    bin_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    if os.path.isdir(LLAMA_CPP_INSTALL_DIR):
+        for root, dirs, files in os.walk(LLAMA_CPP_INSTALL_DIR):
+            for f in files:
+                # Match exact name or starts with llama-server (handles renamed binaries)
+                if f == bin_name or (f.startswith("llama-server") and os.access(os.path.join(root, f), os.X_OK)):
+                    found_bin = os.path.join(root, f)
+                    # Update config so we don't need to search again
+                    state.config["llama_server_bin"] = found_bin
+                    state.save_config()
+                    _log(f"Resolved llama-server from install dir: {found_bin}")
+                    return found_bin
+
+    # Try common locations relative to the script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, raw),
+        os.path.join(script_dir, raw + ".exe"),
+        os.path.join(script_dir, "llama", raw),
+        os.path.join(script_dir, "llama", raw + ".exe"),
+        os.path.join(script_dir, "bin", raw),
+        os.path.join(script_dir, "bin", raw + ".exe"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
 
     return raw  # Return as-is, Popen will raise the error
 
@@ -225,6 +239,17 @@ def _auto_setup_llama_binaries():
     # All binaries go into LLAMA_CPP_INSTALL_DIR so they live alongside llama.cpp source
     bin_dir = LLAMA_CPP_INSTALL_DIR
     bin_path = os.path.join(bin_dir, bin_name)
+
+    # Scan install dir recursively for any existing llama-server binary
+    if os.path.isdir(bin_dir):
+        for root, dirs, files in os.walk(bin_dir):
+            for f in files:
+                if f == bin_name or (f.startswith("llama-server") and os.access(os.path.join(root, f), os.X_OK)):
+                    found_bin = os.path.join(root, f)
+                    state.config["llama_server_bin"] = found_bin
+                    state.save_config()
+                    _log(f"Auto-setup: Found existing llama-server binary at {found_bin}")
+                    return True
 
     if os.path.exists(bin_path):
         state.config["llama_server_bin"] = bin_path
@@ -310,8 +335,12 @@ def _start_llama_server(config_override=None):
         _log(f"  Config changed. Restarting server...")
         _stop_llama_server()
 
-    # Resolve the binary path
+    # Resolve the binary path — run auto-setup first if needed
     resolved_bin = _resolve_llama_server_bin()
+    if not os.path.isfile(resolved_bin):
+        # Try auto-setup as a last resort
+        _auto_setup_llama_binaries()
+        resolved_bin = _resolve_llama_server_bin()
     if not os.path.isfile(resolved_bin):
         return (
             f"llama-server binary not found: '{state.config.get('llama_server_bin', '')}'\n"

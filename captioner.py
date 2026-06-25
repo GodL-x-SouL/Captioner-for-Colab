@@ -83,7 +83,7 @@ class AppState:
             "mmproj_path": os.environ.get("LLAMA_MMPROJ", ""),
             "model_dir": MODEL_DIR,
             "mmproj_dir": MODEL_DIR,
-            "port": int(os.environ.get("LLAMA_PORT", 8080)),
+            "port": int(os.environ.get("LLAMA_PORT", 18080)),
             "ctx_size": 16384,
             "gpu_layers": 99
         }

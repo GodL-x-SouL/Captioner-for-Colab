@@ -1969,7 +1969,7 @@ def _download_hf_file(repo_id, filename):
     
     cmd = [
         "aria2c",
-        "-x", "16",
+        "-x", "8",
         "-s", "16",
         "-k", "1M",
         "--summary-interval=1",
@@ -1978,6 +1978,9 @@ def _download_hf_file(repo_id, filename):
         "--max-tries=5",
         "--continue=true",
         "--auto-file-renaming=false",
+        "--file-allocation=none",
+        "--max-connection-per-server=8",
+        "--min-split-size=1M",
         url,
         "-d", dest_dir,
         "-o", filename
@@ -2004,8 +2007,9 @@ def _download_hf_file(repo_id, filename):
                 _log(f"[Download] {line_str}")
                 # Parse aria2c progress output
                 import re as _re
-                # Match patterns like: [  1.2MiB/5.0MiB(24%) CN:16 DL:1.2MiB/s ETA:3s
-                m = _re.search(r'\[([\d.]+)([A-Za-z]+)/([\d.]+)([A-Za-z]+)\((\d+)%\).*?DL:([\d.]+)([A-Za-z]+)/s.*?ETA:(\d+)([a-z]*)', line_str)
+                # Match: [#uuid 1.2MiB/5.0MiB(24%) CN:16 DL:1.2MiB/s ETA:3s]
+                # Also match without the #uuid prefix
+                m = _re.search(r'([\d.]+)([A-Za-z]+)/([\d.]+)([A-Za-z]+)\((\d+)%\).*?DL:([\d.]+)([A-Za-z]+)/s.*?ETA:(\d+)([a-z]*)', line_str)
                 if m:
                     downloaded = float(m.group(1))
                     dl_unit = m.group(2)
@@ -2088,6 +2092,8 @@ def _preset_downloader_worker(preset):
             _log("Preset Download: Qwen 3 8B VL selected. Downloading model and projector...")
             ok1 = _download_hf_file(repo_id, model_file)
             if ok1:
+                _log("Model downloaded. Waiting 5s before projector download to avoid throttling...")
+                time.sleep(5)
                 _download_hf_file(repo_id, mmproj_file)
         elif preset == "gemma":
             repo_id = "unsloth/gemma-4-12b-it-GGUF"
@@ -2097,6 +2103,8 @@ def _preset_downloader_worker(preset):
             _log("Preset Download: Gemma 4 12B selected. Downloading model and projector...")
             ok1 = _download_hf_file(repo_id, model_file)
             if ok1:
+                _log("Model downloaded. Waiting 5s before projector download to avoid throttling...")
+                time.sleep(5)
                 _download_hf_file(repo_id, mmproj_file)
     finally:
         state.downloader_running = False

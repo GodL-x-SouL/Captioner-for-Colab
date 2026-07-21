@@ -21,6 +21,7 @@ import traceback
 import webbrowser
 import json
 import queue
+import zipfile
 from pathlib import Path
 
 import requests
@@ -37,6 +38,28 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(SCRIPT_DIR, "model")
 PROMPTS_DIR = os.path.join(SCRIPT_DIR, "prompts")
 os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLAB DETECTION & DEFAULT PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_colab():
+    try:
+        import google.colab
+        return True
+    except ImportError:
+        return False
+
+IS_COLAB = _is_colab()
+
+if IS_COLAB:
+    DEFAULT_INPUT_FOLDER = "/content/Captioner-for-Colab/input"
+    DEFAULT_OUTPUT_FOLDER = "/content/Captioner-for-Colab/output"
+else:
+    DEFAULT_INPUT_FOLDER = os.path.join(SCRIPT_DIR, "input")
+    DEFAULT_OUTPUT_FOLDER = os.path.join(SCRIPT_DIR, "output")
+
+os.makedirs(DEFAULT_INPUT_FOLDER, exist_ok=True)
+os.makedirs(DEFAULT_OUTPUT_FOLDER, exist_ok=True)
 
 def _check_llama_binary():
     """Check if llama-server is accessible."""
@@ -85,7 +108,9 @@ class AppState:
             "mmproj_dir": MODEL_DIR,
             "port": int(os.environ.get("LLAMA_PORT", 18080)),
             "ctx_size": 16384,
-            "gpu_layers": 99
+            "gpu_layers": 99,
+            "input_folder": DEFAULT_INPUT_FOLDER,
+            "output_folder": DEFAULT_OUTPUT_FOLDER
         }
         self.stats_lock = threading.Lock()
         self._load_config()
@@ -486,6 +511,48 @@ def _frame_to_b64(img):
 def _load_image(file_path):
     img = PILImage.open(file_path).convert("RGB")
     return img
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZIP FOLDER UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+def _zip_folder_contents(folder_path, output_zip_path=None):
+    """Zip all contents of a folder into a zip file.
+    
+    Args:
+        folder_path: Path to the folder to zip
+        output_zip_path: Optional path for the zip file. If None, creates zip in parent dir.
+    
+    Returns:
+        (success: bool, result: str) - result is zip_path on success, error message on failure
+    """
+    if not os.path.isdir(folder_path):
+        return False, f"Folder not found: {folder_path}"
+    
+    if output_zip_path is None:
+        parent_dir = os.path.dirname(folder_path)
+        folder_name = os.path.basename(folder_path)
+        output_zip_path = os.path.join(parent_dir, f"{folder_name}.zip")
+    
+    try:
+        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, folder_path)
+                    zipf.write(file_path, arcname)
+        
+        zip_size = os.path.getsize(output_zip_path)
+        return True, output_zip_path
+    except Exception as e:
+        return False, str(e)
+
+def _zip_input_folder(output_zip_path=None):
+    """Zip the input folder contents."""
+    return _zip_folder_contents(DEFAULT_INPUT_FOLDER, output_zip_path)
+
+def _zip_output_folder(output_zip_path=None):
+    """Zip the output folder contents."""
+    return _zip_folder_contents(DEFAULT_OUTPUT_FOLDER, output_zip_path)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMPT BUILDERS
@@ -1196,6 +1263,13 @@ select.path-input{
         <div class="slabel">Live Log</div>
         <div class="log-box" id="i_log-box">Ready.</div>
       </div></div>
+
+      <div class="card"><div class="section">
+        <div class="slabel">Zip Folders</div>
+        <button class="btn" style="width:100%;margin-bottom:6px;" onclick="zipFolder('input')">Zip Input Folder</button>
+        <button class="btn" style="width:100%;margin-bottom:6px;" onclick="zipFolder('output')">Zip Output Folder</button>
+        <div class="hint">Download zipped contents of folders for Google Colab</div>
+      </div></div>
     </div>
   </div>
 </div>
@@ -1715,6 +1789,29 @@ downloadHFFile=function(repoId,filename){
   startDlProgressPolling();
   return origDownloadHFFile(repoId,filename);
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZIP FOLDER FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+async function zipFolder(type) {
+  showToast('Starting zip operation...', 'info');
+  try {
+    const res = await fetch('/zip/' + type, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (data.ok) {
+      const sizeMB = (data.size / (1024 * 1024)).toFixed(2);
+      showToast(type.charAt(0).toUpperCase() + type.slice(1) + ' folder zipped successfully! Size: ' + sizeMB + ' MB', 'success', 5000);
+    } else {
+      showToast('Failed to zip ' + type + ' folder: ' + data.error, 'error');
+    }
+  } catch(e) {
+    showToast('Network error: ' + e, 'error');
+  }
+}
 </script>
 </body>
 </html>"""
@@ -2190,6 +2287,43 @@ def downloader_status():
 def downloader_progress():
     with state.stats_lock:
         return jsonify(state.download_progress.copy())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZIP FOLDER ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/zip/input", methods=["POST"])
+def zip_input():
+    data = request.get_json() or {}
+    output_path = data.get("output_path")
+    success, result = _zip_input_folder(output_path)
+    if success:
+        return jsonify({"ok": True, "zip_path": result, "size": os.path.getsize(result)})
+    else:
+        return jsonify({"ok": False, "error": result}), 500
+
+@app.route("/zip/output", methods=["POST"])
+def zip_output():
+    data = request.get_json() or {}
+    output_path = data.get("output_path")
+    success, result = _zip_output_folder(output_path)
+    if success:
+        return jsonify({"ok": True, "zip_path": result, "size": os.path.getsize(result)})
+    else:
+        return jsonify({"ok": False, "error": result}), 500
+
+@app.route("/zip/custom", methods=["POST"])
+def zip_custom():
+    data = request.get_json()
+    folder = data.get("folder", "")
+    output_path = data.get("output_path")
+    if not folder:
+        return jsonify({"ok": False, "error": "Missing folder parameter"}), 400
+    success, result = _zip_folder_contents(folder, output_path)
+    if success:
+        return jsonify({"ok": True, "zip_path": result, "size": os.path.getsize(result)})
+    else:
+        return jsonify({"ok": False, "error": result}), 500
 
 
 if __name__ == "__main__":

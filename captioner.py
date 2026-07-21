@@ -1265,10 +1265,12 @@ select.path-input{
       </div></div>
 
       <div class="card"><div class="section">
-        <div class="slabel">Zip Folders</div>
-        <button class="btn" style="width:100%;margin-bottom:6px;" onclick="zipFolder('input')">Zip Input Folder</button>
-        <button class="btn" style="width:100%;margin-bottom:6px;" onclick="zipFolder('output')">Zip Output Folder</button>
-        <div class="hint">Download zipped contents of folders for Google Colab</div>
+        <div class="slabel">Zip &amp; Clean Folders</div>
+        <button class="btn-primary" style="width:100%;margin-bottom:6px;" onclick="zipFolder('input')">Zip Input Folder</button>
+        <button class="btn-primary" style="width:100%;margin-bottom:6px;" onclick="zipFolder('output')">Zip Output Folder</button>
+        <button class="btn-danger" style="width:100%;margin-bottom:6px;" onclick="deleteFolder('input')">Delete Input Contents</button>
+        <button class="btn-danger" style="width:100%;margin-bottom:6px;" onclick="deleteFolder('output')">Delete Output Contents</button>
+        <div class="hint">Zip for download or clear folder contents for Google Colab</div>
       </div></div>
     </div>
   </div>
@@ -1812,6 +1814,25 @@ async function zipFolder(type) {
     showToast('Network error: ' + e, 'error');
   }
 }
+
+async function deleteFolder(type) {
+  if (!confirm('Delete all contents of the ' + type + ' folder?')) return;
+  showToast('Deleting ' + type + ' folder contents...', 'info');
+  try {
+    const res = await fetch('/delete/' + type, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'}
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(type.charAt(0).toUpperCase() + type.slice(1) + ' folder cleared! Removed ' + data.deleted + ' items.', 'success', 5000);
+    } else {
+      showToast('Failed to delete ' + type + ' folder: ' + data.error, 'error');
+    }
+  } catch(e) {
+    showToast('Network error: ' + e, 'error');
+  }
+}
 </script>
 </body>
 </html>"""
@@ -2324,6 +2345,31 @@ def zip_custom():
         return jsonify({"ok": True, "zip_path": result, "size": os.path.getsize(result)})
     else:
         return jsonify({"ok": False, "error": result}), 500
+
+@app.route("/delete/input", methods=["POST"])
+def delete_input():
+    return _delete_folder_contents(DEFAULT_INPUT_FOLDER)
+
+@app.route("/delete/output", methods=["POST"])
+def delete_output():
+    return _delete_folder_contents(DEFAULT_OUTPUT_FOLDER)
+
+def _delete_folder_contents(folder_path):
+    if not os.path.isdir(folder_path):
+        return jsonify({"ok": False, "error": f"Folder not found: {folder_path}"}), 404
+    try:
+        deleted = 0
+        for item in os.listdir(folder_path):
+            item_path = os.path.join(folder_path, item)
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+                deleted += 1
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+                deleted += 1
+        return jsonify({"ok": True, "deleted": deleted})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

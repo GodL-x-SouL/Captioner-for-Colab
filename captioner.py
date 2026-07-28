@@ -1733,12 +1733,12 @@ function formatEta(seconds){
   return m+'m '+s+'s';
 }
 
-function pollDownloadProgress(){
+def pollDownloadProgress(){
   fetch('/downloader/progress').then(r=>r.json()).then(p=>{
     const container=document.getElementById('dl-progress-container');
     if(!container) return;
     
-    if(p.active){
+    if(p.active || p.status==='downloading'){
       container.style.display='block';
       _dlWasActive=true;
       
@@ -2062,11 +2062,10 @@ def set_model():
 # MODEL DOWNLOADER UTILS & ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _download_hf_file(repo_id, filename):
-    from huggingface_hub import hf_hub_download
-    
     dest_dir = os.path.abspath(state.config.get("model_dir", MODEL_DIR))
     os.makedirs(dest_dir, exist_ok=True)
     
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
     _log(f"Starting download of {filename} from {repo_id}...")
     
     # Initialize progress tracking
@@ -2082,30 +2081,50 @@ def _download_hf_file(repo_id, filename):
             "status": "downloading"
         })
     
-    def progress_callback(downloaded, total):
-        if total > 0:
-            pct = int(downloaded * 100 / total)
-            with state.stats_lock:
-                state.download_progress.update({
-                    "downloaded_bytes": downloaded,
-                    "total_bytes": total,
-                    "percent": pct
-                })
-            if downloaded % (1024 * 1024) == 0 or pct in (25, 50, 75, 100):
-                _log(f"[Download] {filename}: {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+    final_path = os.path.join(dest_dir, filename)
+    tmp_path = final_path + ".downloading"
     
     try:
-        cached_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=dest_dir,
-            resume_download=True
-        )
+        r = requests.get(url, stream=True, timeout=30)
+        r.raise_for_status()
         
-        # Copy to destination if not already there
-        final_path = os.path.join(dest_dir, filename)
-        if os.path.abspath(cached_path) != os.path.abspath(final_path):
-            shutil.copy2(cached_path, final_path)
+        total = int(r.headers.get('content-length', 0))
+        downloaded = 0
+        start_time = time.time()
+        last_log_time = start_time
+        
+        with open(tmp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    elapsed = time.time() - start_time
+                    speed = downloaded / elapsed if elapsed > 0 else 0
+                    eta = (total - downloaded) / speed if speed > 0 and total > 0 else 0
+                    pct = int(downloaded * 100 / total) if total > 0 else 0
+                    
+                    with state.stats_lock:
+                        state.download_progress.update({
+                            "downloaded_bytes": downloaded,
+                            "total_bytes": total,
+                            "speed_bps": int(speed),
+                            "eta_seconds": int(eta),
+                            "percent": pct
+                        })
+                    
+                    # Log every 5 seconds or at milestones
+                    now = time.time()
+                    if now - last_log_time >= 5 or pct in (25, 50, 75):
+                        dl_mb = downloaded / (1024 * 1024)
+                        tot_mb = total / (1024 * 1024) if total > 0 else 0
+                        speed_mb = speed / (1024 * 1024)
+                        _log(f"[Download] {filename}: {pct}% ({dl_mb:.1f}/{tot_mb:.1f} MB) - {speed_mb:.1f} MB/s")
+                        last_log_time = now
+        
+        # Move from temp to final path
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        os.rename(tmp_path, final_path)
         
         _log(f"Successfully downloaded {filename} to {dest_dir}")
         with state.stats_lock:
@@ -2122,6 +2141,12 @@ def _download_hf_file(repo_id, filename):
                 "active": False,
                 "status": "failed"
             })
+        # Cleanup partial download
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
         return False
 
 def _downloader_worker(repo_id, filename):

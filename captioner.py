@@ -288,17 +288,18 @@ def _auto_setup_llama_binaries():
     tmp_tar = os.path.join(tempfile.gettempdir(), "llama_binaries.tar.gz")
 
     try:
-        if shutil.which("aria2c"):
-            _log("Auto-setup: using aria2c for fast download...")
-            cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", url, "-d", tempfile.gettempdir(), "-o", "llama_binaries.tar.gz"]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            _log("Auto-setup: aria2c not found, falling back to requests...")
-            r = requests.get(url, stream=True, timeout=120)
-            r.raise_for_status()
-            with open(tmp_tar, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        _log("Auto-setup: downloading llama.cpp binaries...")
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        total = int(r.headers.get('content-length', 0))
+        downloaded = 0
+        with open(tmp_tar, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0 and downloaded % (1024 * 1024) == 0:
+                    pct = int(downloaded * 100 / total)
+                    _log(f"Auto-setup: downloaded {pct}%...")
 
         import tarfile
         # Tarball contains a llama.cpp/ folder — extract to temp, then flatten into bin_dir
@@ -2061,16 +2062,12 @@ def set_model():
 # MODEL DOWNLOADER UTILS & ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _download_hf_file(repo_id, filename):
+    from huggingface_hub import hf_hub_download
+    
     dest_dir = os.path.abspath(state.config.get("model_dir", MODEL_DIR))
     os.makedirs(dest_dir, exist_ok=True)
     
-    if not shutil.which("aria2c"):
-        _log("Error: aria2c is not installed or not in PATH. Please install it first.")
-        return False
-        
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
     _log(f"Starting download of {filename} from {repo_id}...")
-    _log(f"URL: {url}")
     
     # Initialize progress tracking
     with state.stats_lock:
@@ -2085,103 +2082,41 @@ def _download_hf_file(repo_id, filename):
             "status": "downloading"
         })
     
-    cmd = [
-        "aria2c",
-        "-x", "8",
-        "-s", "16",
-        "-k", "1M",
-        "--summary-interval=1",
-        "--timeout=600",
-        "--retry-wait=3",
-        "--max-tries=5",
-        "--continue=true",
-        "--auto-file-renaming=false",
-        "--file-allocation=none",
-        "--max-connection-per-server=8",
-        "--min-split-size=1M",
-        url,
-        "-d", dest_dir,
-        "-o", filename
-    ]
+    def progress_callback(downloaded, total):
+        if total > 0:
+            pct = int(downloaded * 100 / total)
+            with state.stats_lock:
+                state.download_progress.update({
+                    "downloaded_bytes": downloaded,
+                    "total_bytes": total,
+                    "percent": pct
+                })
+            if downloaded % (1024 * 1024) == 0 or pct in (25, 50, 75, 100):
+                _log(f"[Download] {filename}: {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
     
     try:
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
-            
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=creation_flags
+        cached_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=dest_dir,
+            resume_download=True
         )
         
-        for line in iter(process.stdout.readline, ''):
-            line_str = line.strip()
-            if line_str:
-                line_str = line_str.replace('\r', '\n').split('\n')[-1]
-                _log(f"[Download] {line_str}")
-                # Parse aria2c progress output
-                import re as _re
-                # Match: [#uuid 1.2MiB/5.0MiB(24%) CN:16 DL:1.2MiB/s ETA:3s]
-                # Also match without the #uuid prefix
-                m = _re.search(r'([\d.]+)([A-Za-z]+)/([\d.]+)([A-Za-z]+)\((\d+)%\).*?DL:([\d.]+)([A-Za-z]+)/s.*?ETA:(\d+)([a-z]*)', line_str)
-                if m:
-                    downloaded = float(m.group(1))
-                    dl_unit = m.group(2)
-                    total = float(m.group(3))
-                    tot_unit = m.group(4)
-                    pct = int(m.group(5))
-                    speed = float(m.group(6))
-                    speed_unit = m.group(7)
-                    eta = int(m.group(8))
-                    eta_unit = m.group(9)
-                    
-                    # Convert to bytes
-                    unit_mult = {"B": 1, "KiB": 1024, "MiB": 1024*1024, "GiB": 1024*1024*1024}
-                    dl_bytes = downloaded * unit_mult.get(dl_unit, 1)
-                    tot_bytes = total * unit_mult.get(tot_unit, 1)
-                    speed_bytes = speed * unit_mult.get(speed_unit, 1)
-                    eta_secs = eta * (60 if eta_unit == "m" else 1)
-                    
-                    with state.stats_lock:
-                        state.download_progress.update({
-                            "downloaded_bytes": int(dl_bytes),
-                            "total_bytes": int(tot_bytes),
-                            "speed_bps": int(speed_bytes),
-                            "eta_seconds": eta_secs,
-                            "percent": pct
-                        })
-                else:
-                    # Fallback: try to match simpler percentage patterns
-                    m2 = _re.search(r'(\d+)%', line_str)
-                    if m2:
-                        with state.stats_lock:
-                            state.download_progress["percent"] = int(m2.group(1))
-                
-        process.stdout.close()
-        returncode = process.wait()
-        if returncode == 0:
-            _log(f"Successfully downloaded {filename} to {dest_dir}")
-            with state.stats_lock:
-                state.download_progress.update({
-                    "active": False,
-                    "status": "completed",
-                    "percent": 100
-                })
-            return True
-        else:
-            _log(f"aria2c failed with return code {returncode}")
-            with state.stats_lock:
-                state.download_progress.update({
-                    "active": False,
-                    "status": "failed"
-                })
-            return False
+        # Copy to destination if not already there
+        final_path = os.path.join(dest_dir, filename)
+        if os.path.abspath(cached_path) != os.path.abspath(final_path):
+            shutil.copy2(cached_path, final_path)
+        
+        _log(f"Successfully downloaded {filename} to {dest_dir}")
+        with state.stats_lock:
+            state.download_progress.update({
+                "active": False,
+                "status": "completed",
+                "percent": 100
+            })
+        return True
     except Exception as e:
-        _log(f"Download error: {e}")
+        _log(f"Download failed: {e}")
         with state.stats_lock:
             state.download_progress.update({
                 "active": False,

@@ -2064,10 +2064,12 @@ def set_model():
 def _download_hf_file(repo_id, filename):
     dest_dir = os.path.abspath(state.config.get("model_dir", MODEL_DIR))
     os.makedirs(dest_dir, exist_ok=True)
-    
+
     url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-    _log(f"Starting download of {filename} from {repo_id}...")
-    
+    final_path = os.path.join(dest_dir, filename)
+    tmp_path = final_path + ".downloading"
+    headers = {"User-Agent": "Dataset-Captioner/1.0"}
+
     # Initialize progress tracking
     with state.stats_lock:
         state.download_progress.update({
@@ -2080,21 +2082,143 @@ def _download_hf_file(repo_id, filename):
             "percent": 0,
             "status": "downloading"
         })
-    
-    final_path = os.path.join(dest_dir, filename)
-    tmp_path = final_path + ".downloading"
-    
+
+    # Get total file size
+    total = 0
     try:
-        r = requests.get(url, stream=True, timeout=30)
+        head = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
+        total = int(head.headers.get("content-length", 0))
+    except Exception:
+        total = 0
+
+    # Skip if already fully downloaded
+    if total > 0 and os.path.isfile(final_path) and os.path.getsize(final_path) == total:
+        _log(f"{filename} already exists in {dest_dir}. Skipping download.")
+        with state.stats_lock:
+            state.download_progress.update({
+                "active": False,
+                "status": "completed",
+                "percent": 100,
+                "total_bytes": total,
+                "downloaded_bytes": total
+            })
+        return True
+
+    _log(f"Starting download of {filename} from {repo_id} ({total // (1024*1024)} MB)...")
+
+    if total <= 0:
+        # Unknown size -> single-stream fallback
+        return _stream_download(url, final_path, tmp_path, headers, filename)
+
+    # ── Parallel segmented download (HTTP Range) for maximum speed ──
+    num_parts = min(10, max(4, total // (512 * 1024 * 1024) + 1))
+    part_size = (total + num_parts - 1) // num_parts
+
+    # Pre-allocate temp file so parts can write at their offsets
+    with open(tmp_path, "wb") as f:
+        f.truncate(total)
+
+    lock = threading.Lock()
+    counter = {"downloaded": 0}
+    results = {}
+    start_time = time.time()
+    last_log_time = start_time
+
+    def _download_part(idx):
+        start = idx * part_size
+        end = min(total - 1, start + part_size - 1)
+        part_headers = dict(headers)
+        part_headers["Range"] = f"bytes={start}-{end}"
+        for attempt in range(3):
+            try:
+                r = requests.get(url, headers=part_headers, stream=True, timeout=60)
+                r.raise_for_status()
+                with open(tmp_path, "r+b") as f:
+                    f.seek(start)
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            with lock:
+                                counter["downloaded"] += len(chunk)
+                results[idx] = True
+                return
+            except Exception as e:
+                if attempt == 2:
+                    _log(f"[Download] part {idx+1}/{num_parts} failed after retries: {e}")
+                    results[idx] = False
+                    return
+                time.sleep(2)
+
+    threads = [threading.Thread(target=_download_part, args=(i,), daemon=True) for i in range(num_parts)]
+    for t in threads:
+        t.start()
+
+    # Monitor progress while parts run
+    while any(t.is_alive() for t in threads):
+        time.sleep(0.5)
+        with lock:
+            dl = counter["downloaded"]
+        elapsed = time.time() - start_time
+        speed = dl / elapsed if elapsed > 0 else 0
+        eta = (total - dl) / speed if speed > 0 else 0
+        pct = min(99, int(dl * 100 / total)) if total > 0 else 0
+        with state.stats_lock:
+            state.download_progress.update({
+                "downloaded_bytes": dl,
+                "total_bytes": total,
+                "speed_bps": int(speed),
+                "eta_seconds": int(eta),
+                "percent": pct
+            })
+        now = time.time()
+        if now - last_log_time >= 5:
+            _log(f"[Download] {filename}: {pct}% ({dl/1048576:.1f}/{total/1048576:.1f} MB) - {speed/1048576:.1f} MB/s")
+            last_log_time = now
+
+    for t in threads:
+        t.join()
+
+    ok = all(results.get(i) for i in range(num_parts))
+    if ok:
+        # Move from temp to final path
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        os.rename(tmp_path, final_path)
+        _log(f"Successfully downloaded {filename} to {dest_dir}")
+        with state.stats_lock:
+            state.download_progress.update({
+                "active": False,
+                "status": "completed",
+                "percent": 100
+            })
+        return True
+    else:
+        _log(f"Download failed: {sum(1 for i in range(num_parts) if not results.get(i))}/{num_parts} parts failed")
+        with state.stats_lock:
+            state.download_progress.update({
+                "active": False,
+                "status": "failed"
+            })
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+        return False
+
+def _stream_download(url, final_path, tmp_path, headers, filename):
+    """Single-stream fallback when file size is unknown or Range is unsupported."""
+    try:
+        r = requests.get(url, headers=headers, stream=True, timeout=30)
         r.raise_for_status()
-        
+
         total = int(r.headers.get('content-length', 0))
         downloaded = 0
         start_time = time.time()
         last_log_time = start_time
-        
+
         with open(tmp_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
@@ -2102,7 +2226,7 @@ def _download_hf_file(repo_id, filename):
                     speed = downloaded / elapsed if elapsed > 0 else 0
                     eta = (total - downloaded) / speed if speed > 0 and total > 0 else 0
                     pct = int(downloaded * 100 / total) if total > 0 else 0
-                    
+
                     with state.stats_lock:
                         state.download_progress.update({
                             "downloaded_bytes": downloaded,
@@ -2111,22 +2235,17 @@ def _download_hf_file(repo_id, filename):
                             "eta_seconds": int(eta),
                             "percent": pct
                         })
-                    
-                    # Log every 5 seconds or at milestones
+
                     now = time.time()
                     if now - last_log_time >= 5 or pct in (25, 50, 75):
-                        dl_mb = downloaded / (1024 * 1024)
-                        tot_mb = total / (1024 * 1024) if total > 0 else 0
-                        speed_mb = speed / (1024 * 1024)
-                        _log(f"[Download] {filename}: {pct}% ({dl_mb:.1f}/{tot_mb:.1f} MB) - {speed_mb:.1f} MB/s")
+                        _log(f"[Download] {filename}: {pct}% ({downloaded/1048576:.1f}/{total/1048576:.1f} MB) - {speed/1048576:.1f} MB/s")
                         last_log_time = now
-        
-        # Move from temp to final path
+
         if os.path.exists(final_path):
             os.remove(final_path)
         os.rename(tmp_path, final_path)
-        
-        _log(f"Successfully downloaded {filename} to {dest_dir}")
+
+        _log(f"Successfully downloaded {filename}")
         with state.stats_lock:
             state.download_progress.update({
                 "active": False,
@@ -2141,7 +2260,6 @@ def _download_hf_file(repo_id, filename):
                 "active": False,
                 "status": "failed"
             })
-        # Cleanup partial download
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)

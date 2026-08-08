@@ -1733,7 +1733,7 @@ function formatEta(seconds){
   return m+'m '+s+'s';
 }
 
-def pollDownloadProgress(){
+function pollDownloadProgress(){
   fetch('/downloader/progress').then(r=>r.json()).then(p=>{
     const container=document.getElementById('dl-progress-container');
     if(!container) return;

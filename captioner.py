@@ -266,6 +266,64 @@ def _resolve_llama_server_bin():
     return raw  # Return as-is, Popen will raise the error
 
 
+def _llama_library_path(bin_path):
+    """Build LD_LIBRARY_PATH including the CUDA runtime libs.
+
+    The bundled llama-server is linked against libcudart.so.12 (CUDA 12).
+    Colab does not always put the CUDA lib dir on the default path, and the
+    binary can live in a subfolder (llama.cpp/llama_cpp/) while the .so
+    files sit in a sibling/parent folder, so collect every plausible dir:
+    the binary's folder and its parents, any dir under the install tree that
+    holds .so files, the system CUDA dirs, and the NVIDIA libs bundled
+    with torch/pip.
+    """
+    import glob as _glob
+
+    dirs = []
+
+    def _add(p):
+        if p and os.path.isdir(p) and p not in dirs:
+            dirs.append(p)
+
+    bin_dir = os.path.dirname(os.path.abspath(bin_path))
+    _add(bin_dir)
+    parent = bin_dir
+    for _ in range(3):
+        parent = os.path.dirname(parent)
+        _add(parent)
+
+    # Any dir inside the install tree that actually holds shared objects.
+    try:
+        if os.path.isdir(LLAMA_CPP_INSTALL_DIR):
+            for root, _dirs, files in os.walk(LLAMA_CPP_INSTALL_DIR):
+                if any(f.endswith((".so", ".so.12")) for f in files):
+                    _add(root)
+    except Exception:
+        pass
+
+    for candidate in (
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+    ):
+        _add(candidate)
+    try:
+        for pattern in (
+            "/usr/local/cuda-*/lib64",
+            "/usr/local/lib/python*/dist-packages/nvidia/*/lib",
+            "/usr/lib/python3/dist-packages/nvidia/*/lib",
+        ):
+            for hit in _glob.glob(pattern):
+                _add(hit)
+    except Exception:
+        pass
+
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = dirs + ([existing] if existing else [])
+    return ":".join(parts)
+
+
 def _auto_setup_llama_binaries():
     """Automatically downloads and configures the optimized llama-server binary for Colab/T4."""
     bin_name = "llama-server"
@@ -446,11 +504,11 @@ def _start_llama_server(config_override=None):
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NO_WINDOW
 
-        # Set LD_LIBRARY_PATH to include the binary's directory so shared libs are found
+        # Include the CUDA runtime (libcudart.so.12 etc.) and any bundled
+        # .so folders so the CUDA binary can actually load on Colab.
         env = os.environ.copy()
-        bin_dir = os.path.dirname(os.path.abspath(resolved_bin))
-        existing_ld = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = bin_dir + (":" + existing_ld if existing_ld else "")
+        env["LD_LIBRARY_PATH"] = _llama_library_path(resolved_bin)
+        _log(f"     LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}")
 
         state.server_process = subprocess.Popen(cmd, stdout=lf, stderr=lf, creationflags=creation_flags, env=env)
     except FileNotFoundError as e:
@@ -488,7 +546,23 @@ def _start_llama_server(config_override=None):
                 tail = Path(log_path).read_text(encoding="utf-8")[-1500:]
             except Exception:
                 tail = "(log unreadable)"
-            return f"Server crashed after {i+1}s. Check llama_server.log:\n{tail}"
+            missing = ""
+            if "cannot open shared object" in tail.lower() or "not found" in tail.lower():
+                try:
+                    ldd = subprocess.run(
+                        ["ldd", resolved_bin], capture_output=True, text=True, timeout=15,
+                        env={**os.environ, "LD_LIBRARY_PATH": env.get("LD_LIBRARY_PATH", "")},
+                    )
+                    missing_lines = [
+                        line.strip() for line in (ldd.stdout + ldd.stderr).splitlines()
+                        if "not found" in line
+                    ]
+                    if missing_lines:
+                        missing = "\nMissing libs:\n" + "\n".join(missing_lines)
+                        _log("  ldd missing libs:\n" + missing)
+                except Exception:
+                    pass
+            return f"Server crashed after {i+1}s. Check llama_server.log:\n{tail}{missing}"
 
     _log(f"  llama-server did not respond in 180s. Check {log_path}")
     return "timeout"

@@ -29,6 +29,14 @@ import requests
 from flask import Flask, jsonify, render_template_string, request
 from PIL import Image as PILImage
 
+# The UI polls /status (3s), /progress + /log (~1s) and
+# /downloader/progress (1s) forever, and Werkzeug logs every request to
+# stderr — which the Colab notebook pipes into its SYSTEM LOGS, burying real
+# output under GET /downloader/progress noise even after downloads finish.
+# Silence access logs, keep real errors.
+import logging
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EARLY ENVIRONMENT & DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────

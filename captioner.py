@@ -8,6 +8,7 @@ Opens:  http://127.0.0.1:7860
 """
 
 import base64
+import gc
 import io
 import os
 import re
@@ -110,7 +111,14 @@ class AppState:
             "ctx_size": 16384,
             "gpu_layers": 99,
             "input_folder": DEFAULT_INPUT_FOLDER,
-            "output_folder": DEFAULT_OUTPUT_FOLDER
+            "output_folder": DEFAULT_OUTPUT_FOLDER,
+            # Micro-batch mode: caption at most `batch_size` images, then
+            # unload and restart llama-server before the next micro-batch.
+            # Restarting the server frees VRAM/KV-cache held by the previous
+            # micro-batch, which is what makes large (60+) image runs OOM on
+            # Colab/T4 otherwise. Defaults suit a 60-image curated dataset.
+            "batch_mode": True,
+            "batch_size": 20
         }
         self.stats_lock = threading.Lock()
         self._load_config()
@@ -151,6 +159,9 @@ state = AppState()
 def _log(msg: str):
     with state.log_lock:
         state.log_lines.append(msg)
+        # Cap the in-memory log so long bulk runs cannot balloon RAM.
+        if len(state.log_lines) > 2000:
+            del state.log_lines[:-2000]
         print(msg, flush=True)
 
 def _safe_get(cfg, key, default=None):
@@ -710,34 +721,58 @@ def _caption_one(file_path, system_prompt, trigger):
         return cap, None
     except Exception as e:
         return None, str(e)
+    finally:
+        # Free the decoded image immediately; holding PIL frames across a
+        # bulk run is one of the slow RAM leaks on Colab.
+        try:
+            for frame in frames:
+                frame.close()
+        except Exception:
+            pass
+        del frames
+        gc.collect()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BATCH PROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
-def _producer(cfg, q, stats):
-    try:
-        input_folder  = _safe_get(cfg, "input_folder", "")
-        output_folder = _safe_get(cfg, "output_folder", "") or input_folder
-        skip_ex       = _safe_get(cfg, "skip_existing", False)
+def _chunked(iterable, size):
+    """Yield consecutive chunks of at most `size` items."""
+    items = list(iterable)
+    if size <= 0:
+        yield items
+        return
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
-        IMAGE_EXTS = (".jpg",".jpeg",".png",".webp",".bmp",".tiff",".tif")
-        all_files  = sorted(os.listdir(input_folder))
-        images = [os.path.join(input_folder,f) for f in all_files if f.lower().endswith(IMAGE_EXTS)]
 
-        for img_src in images:
-            if state.batch_stop:
-                break
-            with state.stats_lock:
-                if img_src in state.completed_files:
-                    continue
-            stem = os.path.splitext(os.path.basename(img_src))[0]
-            txt = os.path.join(output_folder, stem + ".txt")
-            if skip_ex and os.path.exists(txt):
-                stats['skipped'] += 1
+def _producer_for_files(cfg, q, stats, image_paths):
+    output_folder = _safe_get(cfg, "output_folder", "") or _safe_get(cfg, "input_folder", "")
+    skip_ex = _safe_get(cfg, "skip_existing", False)
+    for img_src in image_paths:
+        if state.batch_stop:
+            break
+        with state.stats_lock:
+            if img_src in state.completed_files:
                 continue
-            q.put({"type": "image", "path": img_src, "txt": txt})
-    finally:
-        pass
+        stem = os.path.splitext(os.path.basename(img_src))[0]
+        txt = os.path.join(output_folder, stem + ".txt")
+        if skip_ex and os.path.exists(txt):
+            with state.stats_lock:
+                stats['skipped'] += 1
+            continue
+        q.put({"type": "image", "path": img_src, "txt": txt})
+
+
+def _producer(cfg, q, stats):
+    input_folder = _safe_get(cfg, "input_folder", "")
+    IMAGE_EXTS = (".jpg",".jpeg",".png",".webp",".bmp",".tiff",".tif")
+    try:
+        all_files = sorted(os.listdir(input_folder))
+    except Exception as e:
+        _log(f"  could not list input folder {input_folder}: {e}")
+        return
+    images = [os.path.join(input_folder, f) for f in all_files if f.lower().endswith(IMAGE_EXTS)]
+    _producer_for_files(cfg, q, stats, images)
 
 def _consumer(cfg, q, stats):
     def update_prog():
@@ -773,6 +808,8 @@ def _consumer(cfg, q, stats):
             src = item["path"]
             txt = item["txt"]
             fname = os.path.basename(src)
+            temp_dst = None
+            cap, err = None, None
 
             if item["type"] == "image":
                 temp_dst = os.path.join(tempfile.gettempdir(), f"prepped_{fname}")
@@ -840,7 +877,73 @@ def _consumer(cfg, q, stats):
                 stats['errors'] += 1
             update_prog()
         finally:
+            # Remove the resized temp copy so bulk runs do not fill /tmp,
+            # and collect garbage after each image.
+            if temp_dst and os.path.exists(temp_dst):
+                try:
+                    os.remove(temp_dst)
+                except Exception:
+                    pass
+            del cap, err
+            gc.collect()
             q.task_done()
+
+def _unload_context_and_restart(tag=""):
+    """Stop llama-server completely, free Python-side memory, then restart.
+
+    Restarting the server subprocess is what releases the VRAM and KV-cache
+    memory accumulated over the previous micro-batch. Simply clearing Python
+    objects is not enough because the weights and cache live in the server.
+    """
+    _log(f"  Unloading context{(' (' + tag + ')') if tag else ''} to free VRAM...")
+    _stop_llama_server()
+    state.current_image_b64 = None
+    gc.collect()
+    _log("  Restarting llama-server with a clean context...")
+    status = _start_llama_server()
+    if "started" in status or "already running" in status:
+        _log("  LLM warm-up after restart...")
+        try:
+            dummy_img = PILImage.new('RGB', (100, 100), color='black')
+            _call_llama("You are an image captioner.", "Describe this image.", [dummy_img], max_tokens=50)
+            dummy_img.close()
+            _log("  Warm-up complete.")
+        except Exception as e:
+            _log(f"  Warm-up failed (ignoring): {e}")
+        return True
+    _log(f"  Server restart failed: {status}")
+    return False
+
+
+def _run_micro_batch(cfg, batch_files, batch_index, total_batches, stats):
+    """Caption one micro-batch of images with a fresh queue and workers."""
+    q = queue.Queue()
+    state.batch_queue = q
+    _log(f"  Micro-batch {batch_index}/{total_batches}: {len(batch_files)} image(s)")
+
+    prod_thread = threading.Thread(
+        target=_producer_for_files, args=(cfg, q, stats, batch_files), daemon=True
+    )
+    prod_thread.start()
+
+    num_workers = int(_safe_get(cfg, "num_workers", 1))
+    consumers = []
+    for i in range(num_workers):
+        t = threading.Thread(target=_consumer, args=(cfg, q, stats), daemon=True)
+        t.start()
+        consumers.append(t)
+
+    prod_thread.join()
+    for _ in range(num_workers):
+        q.put(None)
+    for t in consumers:
+        t.join()
+
+    # Between micro-batches, drop the preview frame and collect garbage so
+    # nothing from this micro-batch is held when the server restarts.
+    state.current_image_b64 = None
+    gc.collect()
+
 
 def _run_batch(cfg):
     global state
@@ -869,40 +972,65 @@ def _run_batch(cfg):
     try:
         dummy_img = PILImage.new('RGB', (100, 100), color='black')
         _call_llama("You are an image captioner.", "Describe this image.", [dummy_img], max_tokens=50)
+        dummy_img.close()
         _log("  LLM warm-up complete.")
     except Exception as e:
         _log(f"  Warm-up failed (ignoring): {e}")
 
-    q = queue.Queue()
-    state.batch_queue = q
     stats = {'done': 0, 'skipped': 0, 'errors': 0}
 
     all_files = sorted(os.listdir(input_folder))
     IMAGE_EXTS = (".jpg",".jpeg",".png",".webp",".bmp",".tiff",".tif")
-    images = [f for f in all_files if f.lower().endswith(IMAGE_EXTS)]
+    image_names = [f for f in all_files if f.lower().endswith(IMAGE_EXTS)]
+    images = [os.path.join(input_folder, f) for f in image_names]
 
     state.batch_progress["total"] = len(images)
     state.batch_progress["start_time"] = time.time()
     state.batch_progress["current"] = 0
 
-    prod_thread = threading.Thread(target=_producer, args=(cfg, q, stats), daemon=True)
-    prod_thread.start()
+    # Bulk micro-batching: same input folder, processed in chunks so a
+    # 60-image run does not hold one ever-growing context. When batch mode
+    # is off, everything runs in a single micro-batch as before.
+    batch_mode = bool(_safe_get(cfg, "batch_mode", True))
+    try:
+        batch_size = int(_safe_get(cfg, "batch_size", 20))
+    except (TypeError, ValueError):
+        batch_size = 20
+    batch_size = max(1, min(batch_size, 200))
 
-    num_workers = int(_safe_get(cfg, "num_workers", 1))
-    _log(f"  Starting {num_workers} consumer worker(s)...")
-    consumers = []
-    for i in range(num_workers):
-        t = threading.Thread(target=_consumer, args=(cfg, q, stats), daemon=True)
-        t.start()
-        consumers.append(t)
+    if batch_mode and batch_size < len(images):
+        micro_batches = list(_chunked(images, batch_size))
+        _log(
+            f"  Batch mode ON: {len(images)} image(s) in {len(micro_batches)} "
+            f"micro-batch(es) of up to {batch_size}; the server will unload "
+            "and restart between micro-batches to free VRAM."
+        )
+    else:
+        if batch_mode:
+            _log(
+                f"  Batch mode ON: {len(images)} image(s) fit in one "
+                f"micro-batch of {batch_size}; no mid-run restart needed."
+            )
+        else:
+            _log("  Batch mode OFF: captioning all images in one pass.")
+        micro_batches = [images] if images else []
 
-    prod_thread.join()
-
-    for _ in range(num_workers):
-        q.put(None)
-
-    for t in consumers:
-        t.join()
+    for index, batch_files in enumerate(micro_batches, start=1):
+        if state.batch_stop:
+            _log("  Stop requested; skipping remaining micro-batches.")
+            break
+        _run_micro_batch(cfg, batch_files, index, len(micro_batches), stats)
+        if state.batch_stop:
+            break
+        if index < len(micro_batches):
+            _log(
+                f"  Micro-batch {index}/{len(micro_batches)} finished "
+                f"({stats['done']} done, {stats['errors']} errors so far). "
+                "Unloading context before the next micro-batch..."
+            )
+            if not _unload_context_and_restart(f"after micro-batch {index}"):
+                _log("  Aborting remaining micro-batches: server did not restart.")
+                break
 
     _log(f"\n{'─'*54}")
     _log(f"  done: {stats['done']} captioned, {stats['skipped']} skipped, {stats['errors']} errors")
@@ -1233,6 +1361,13 @@ select.path-input{
           <div class="toggle-track on" id="itr-skip_existing"></div>
           <span class="toggle-label">Skip images with existing .txt sidecar</span>
         </label>
+        <label class="toggle-row" onclick="itog('batch_mode')">
+          <div class="toggle-track on" id="itr-batch_mode"></div>
+          <span class="toggle-label">Batch mode: unload &amp; restart server between micro-batches (fixes OOM on large datasets)</span>
+        </label>
+        <div class="slabel" style="margin-top:10px;">Images per micro-batch</div>
+        <input class="path-input" id="i_batch_size" type="number" min="1" max="200" value="20">
+        <div class="hint">E.g. 60 images with 20 per batch = 3 micro-batches. After each one the server unloads, frees VRAM, and restarts clean. Turn batch mode off to caption everything in one pass.</div>
       </div></div>
     </div>
 
@@ -1377,11 +1512,16 @@ function switchTab(name){
   if(name==='models'){loadModels();}
 }
 
-const I={system_prompt:'',trigger:'',skip_existing:true};
+const I={system_prompt:'',trigger:'',skip_existing:true,batch_mode:true,batch_size:20};
 function itog(key){
   I[key]=!I[key];
   const t=document.getElementById('itr-'+key);
   if(t)I[key]?t.classList.add('on'):t.classList.remove('on');
+}
+function readBatchInputs(){
+  const el=document.getElementById('i_batch_size');
+  const raw=el?parseInt(el.value,10):20;
+  I.batch_size=(Number.isFinite(raw)&&raw>0)?Math.min(200,raw):20;
 }
 
 let _logInterval=null,_lastLen=0;
@@ -1398,6 +1538,7 @@ function _startBatch(cfg){
 }
 
 function startImages(){
+  readBatchInputs();
   const stopBtn = document.getElementById('i_stop-btn');
   if (stopBtn) {
     stopBtn.textContent = 'Stop';
@@ -1420,6 +1561,7 @@ function startImages(){
 }
 
 function resumeImages() {
+  readBatchInputs();
   const cfg={
     ...I,
     input_folder:document.getElementById('i_input_folder').value.trim(),

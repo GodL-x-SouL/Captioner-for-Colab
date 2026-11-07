@@ -140,8 +140,10 @@ class AppState:
         self.active_model_path = None
         self.active_mmproj_path = None
 
-        self.log_lines = []
+        self.log_lines = []  # list of (seq, msg); seq is monotonic per run
+        self.log_seq = 0       # last sequence number issued for a log line
         self.log_lock = threading.Lock()
+        self._health_cache = {"running": False, "ts": 0.0}
         self.batch_stop = False
         self.batch_running = False
         self.batch_thread = None
@@ -166,11 +168,31 @@ state = AppState()
 
 def _log(msg: str):
     with state.log_lock:
-        state.log_lines.append(msg)
-        # Cap the in-memory log so long bulk runs cannot balloon RAM.
+        state.log_seq += 1
+        state.log_lines.append((state.log_seq, msg))
+        # Cap memory; sequence numbers make trimming safe — the UI filters
+        # by sequence, not by list index, so old entries dropping off the
+        # front can no longer desync the client's offset.
         if len(state.log_lines) > 2000:
             del state.log_lines[:-2000]
         print(msg, flush=True)
+
+
+def _llama_running_cached(ttl=2.0):
+    """Cached health check so /log polling never blocks for up to 3s per
+    request while the server is down/restarting (which stalled the browser's
+    log fetches and made later micro-batches look frozen)."""
+    now = time.time()
+    with state.log_lock:
+        cached = state._health_cache.get("running", False)
+        ts = state._health_cache.get("ts", 0.0)
+    if now - ts < ttl:
+        return cached
+    running = _llama_running()
+    with state.log_lock:
+        state._health_cache["running"] = running
+        state._health_cache["ts"] = now
+    return running
 
 def _safe_get(cfg, key, default=None):
     val = cfg.get(key, default)
@@ -1606,11 +1628,16 @@ function readBatchInputs(){
   I.batch_size=(Number.isFinite(raw)&&raw>0)?Math.min(200,raw):20;
 }
 
-let _logInterval=null,_lastLen=0;
+let _logInterval=null,_lastLen=0,_logRun=0;
 
 function _startBatch(cfg){
   document.getElementById('i_go-btn').disabled=true;
   document.getElementById('i_log-box').textContent='Starting...';
+  // A new run restarts the sequence at 0 server-side. Drop any stale
+  // interval and bump the run token so late responses from a previous run
+  // cannot move the offset ahead and permanently skip the new run's logs.
+  if(_logInterval){clearInterval(_logInterval);_logInterval=null;}
+  _logRun++;
   _lastLen=0;
   fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)})
   .then(r=>r.json()).then(d=>{
@@ -1698,9 +1725,16 @@ async function testSingle(){
 }
 
 function pollLog(){
+  const myRun=_logRun;
   fetch('/log?from='+_lastLen).then(r=>r.json()).then(d=>{
+    if(myRun!==_logRun)return; // stale response from a previous run
     const box=document.getElementById('i_log-box');
-    if(d.lines.length){if(_lastLen===0)box.textContent='';box.textContent+=d.lines.join('\n')+'\n';box.scrollTop=box.scrollHeight;_lastLen+=d.lines.length;}
+    const serverTotal=(typeof d.total==='number')?d.total:(_lastLen+d.lines.length);
+    if(serverTotal<_lastLen){_lastLen=0;box.textContent='';} // server restarted its sequence
+    if(d.lines.length){if(_lastLen===0)box.textContent='';box.textContent+=d.lines.join('\n')+'\n';box.scrollTop=box.scrollHeight;}
+    // _lastLen is the last seen sequence number, not an append count.
+    // Trust the server total so the offset can never drift ahead.
+    _lastLen=serverTotal;
     if(d.done){
       clearInterval(_logInterval);
       document.getElementById('i_go-btn').disabled=false;
@@ -2099,6 +2133,7 @@ def start():
         return jsonify({"ok": False, "error": "batch already running"})
     with state.log_lock:
         state.log_lines = []
+        state.log_seq = 0
     state.batch_stop = False
     state.batch_running = True
     cfg = request.get_json()
@@ -2125,12 +2160,10 @@ def start():
             print(err, flush=True)
             with open(_batch_log_file, "a", encoding="utf-8") as f:
                 f.write(err + "\n")
-            with state.log_lock:
-                state.log_lines.append(err)
+            _log(err)
         finally:
             state.batch_running = False
-            with state.log_lock:
-                state.log_lines.append("\n[Batch process finished]")
+            _log("\n[Batch process finished]")
 
     state.batch_thread = threading.Thread(target=run, daemon=True)
     state.batch_thread.start()
@@ -2158,10 +2191,25 @@ def stop():
 
 @app.route("/log")
 def log():
-    from_idx = int(request.args.get("from", 0))
+    # `from` is the last sequence number the client has seen, NOT a list
+    # index. List-index offsets desync whenever the server rebinds/trims the
+    # list (e.g. across server restarts and /start resets), which made the
+    # UI skip every log line after the first micro-batch. Sequence numbers
+    # are stable: the client always asks for "everything after seq N" and
+    # resyncs to the server's total, so it can never get stuck ahead.
+    try:
+        from_seq = int(request.args.get("from", 0))
+    except (TypeError, ValueError):
+        from_seq = 0
     with state.log_lock:
-        lines = state.log_lines[from_idx:]
-    return jsonify({"lines": lines, "done": not state.batch_running, "server_running": _llama_running()})
+        total_seq = state.log_seq
+        lines = [msg for seq, msg in state.log_lines if seq > from_seq]
+    return jsonify({
+        "lines": lines,
+        "total": total_seq,
+        "done": not state.batch_running,
+        "server_running": _llama_running_cached(),
+    })
 
 @app.route("/status")
 def status():
